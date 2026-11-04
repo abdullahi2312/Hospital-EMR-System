@@ -8,7 +8,8 @@
 
   res.status(status).json({
     success: false,
-    message
+    message,
+    data: null
   });
 }
 

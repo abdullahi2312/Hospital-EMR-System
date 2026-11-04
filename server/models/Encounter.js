@@ -45,6 +45,31 @@ const encounterSchema = new mongoose.Schema(
       type: String,
       trim: true
     },
+    clinicalNotes: {
+      type: String,
+      trim: true,
+      maxlength: [10000, 'Clinical notes cannot exceed 10000 characters']
+    },
+    examinationFindings: {
+      type: String,
+      trim: true,
+      maxlength: [10000, 'Examination findings cannot exceed 10000 characters']
+    },
+    assessment: {
+      type: String,
+      trim: true,
+      maxlength: [5000, 'Assessment cannot exceed 5000 characters']
+    },
+    treatmentPlan: {
+      type: String,
+      trim: true,
+      maxlength: [10000, 'Treatment plan cannot exceed 10000 characters']
+    },
+    followUpInstructions: {
+      type: String,
+      trim: true,
+      maxlength: [5000, 'Follow-up instructions cannot exceed 5000 characters']
+    },
     openedAt: {
       type: Date,
       default: Date.now

@@ -19,6 +19,14 @@ const accessLogSchema = new mongoose.Schema(
       ref: 'Encounter',
       index: true
     },
+    consent: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Consent'
+    },
+    breakGlass: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'BreakGlass'
+    },
     action: {
       type: String,
       required: [true, 'Access action is required'],
@@ -37,8 +45,8 @@ const accessLogSchema = new mongoose.Schema(
       type: String,
       required: [true, 'Access method is required'],
       enum: {
-        values: ['assigned_visit', 'patient_consent', 'break_glass', 'denied'],
-        message: 'Access method must be assigned_visit, patient_consent, break_glass, or denied'
+        values: ['assigned_visit', 'patient_consent', 'patient_portal', 'break_glass', 'denied'],
+        message: 'Access method must be assigned_visit, patient_consent, patient_portal, break_glass, or denied'
       }
     },
     ipAddress: {
@@ -61,6 +69,15 @@ const accessLogSchema = new mongoose.Schema(
     timestamps: true
   }
 );
+
+accessLogSchema.pre('validate', function preventConflictingAuthorizationRecords() {
+  if (this.consent && this.breakGlass) {
+    this.invalidate(
+      'breakGlass',
+      'An access event cannot be justified by both consent and break-glass records'
+    );
+  }
+});
 
 const AccessLog = mongoose.model('AccessLog', accessLogSchema);
 

@@ -19,6 +19,14 @@ const consentSchema = new mongoose.Schema(
       ref: 'User',
       required: [true, 'Granting user is required']
     },
+    scope: {
+      type: String,
+      enum: {
+        values: ['clinical_record'],
+        message: 'Scope must be clinical_record'
+      },
+      default: 'clinical_record'
+    },
     status: {
       type: String,
       enum: {
