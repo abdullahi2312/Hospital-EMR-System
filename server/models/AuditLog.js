@@ -88,6 +88,12 @@ const auditLogSchema = new mongoose.Schema(
       },
       immutable: true
     },
+    paymentDeduplicationKey: {
+      type: String,
+      immutable: true,
+      select: false,
+      match: [/^[a-f0-9]{64}$/, 'Payment audit deduplication key must be a SHA-256 HMAC']
+    },
     ipAddress: {
       type: String,
       trim: true,
@@ -141,6 +147,14 @@ auditLogSchema.index({ actor: 1 }, { name: 'audit_actor' });
 auditLogSchema.index({ action: 1 }, { name: 'audit_action' });
 auditLogSchema.index({ entityType: 1, entityId: 1 }, { name: 'audit_entity' });
 auditLogSchema.index({ createdAt: -1 }, { name: 'audit_created_at' });
+auditLogSchema.index(
+  { paymentDeduplicationKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { paymentDeduplicationKey: { $type: 'string' } },
+    name: 'unique_payment_audit_deduplication_key'
+  }
+);
 
 const AuditLog = mongoose.model('AuditLog', auditLogSchema);
 

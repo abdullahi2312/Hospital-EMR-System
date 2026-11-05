@@ -10,6 +10,7 @@ const { authorizePatientRecordAccess } = require('./patient-access.service');
 const { writeAuditLog } = require('./audit-log.service');
 
 const ORDER_AUDIT_ACTION = 'lab_order_created';
+const CANCELLATION_AUDIT_ACTION = 'lab_order_cancelled';
 const RESULT_AUDIT_ACTION = 'lab_result_recorded';
 const REJECTION_AUDIT_ACTION = 'lab_sample_rejected';
 const ORDER_ENTITY = 'LabOrder';
@@ -17,6 +18,7 @@ const RESULT_ENTITY = 'LabResult';
 const ORDER_PRIORITIES = ['routine', 'urgent', 'emergency'];
 const ORDER_RESULTABLE_STATUSES = ['pending', 'sample_collected', 'processing'];
 const REJECTABLE_STATUSES = ['pending', 'sample_collected', 'processing'];
+const CANCELLABLE_STATUSES = ['pending', 'sample_collected', 'processing'];
 
 function serviceError(message, status = 400, properties = {}) {
   const error = new Error(message);
@@ -65,6 +67,35 @@ function normalizeIdempotencyKey(value) {
     throw serviceError('An idempotencyKey between 8 and 128 characters is required');
   }
   return key;
+}
+
+function normalizeComponents(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw serviceError('components must be a non-empty array when provided');
+  }
+  const ids = new Set();
+  return value.map((component) => {
+    requireObject(component, 'Lab component');
+    rejectUnknownFields(component, new Set(['componentId', 'name']), 'Lab component');
+    const componentId = normalizeText(component.componentId, 'Component ID', 80)
+      .toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]*$/.test(componentId)) {
+      throw serviceError('Component ID format is invalid');
+    }
+    if (ids.has(componentId)) throw serviceError('Lab component IDs must be unique');
+    ids.add(componentId);
+    return { componentId, name: normalizeText(component.name, 'Component name', 200) };
+  });
+}
+
+function componentsForOrder(order) {
+  return Array.isArray(order.components) && order.components.length > 0
+    ? order.components.map((component) => ({
+      componentId: String(component.componentId).toLowerCase(),
+      name: component.name
+    }))
+    : [{ componentId: 'default', name: order.testName }];
 }
 
 function deterministicId(kind, ownerId, parentId, key) {
@@ -138,7 +169,8 @@ function sameOrder(order, data, doctorId, patientId, encounterId) {
     String(order.encounter) === encounterId &&
     order.testName === data.testName &&
     (order.instructions || undefined) === data.instructions &&
-    order.priority === data.priority;
+    order.priority === data.priority &&
+    JSON.stringify(order.components || undefined) === JSON.stringify(data.components);
 }
 
 function serializeOrder(order) {
@@ -148,11 +180,19 @@ function serializeOrder(order) {
     encounter: order.encounter.toString(),
     doctor: order.doctor.toString(),
     testName: order.testName,
+    ...(Array.isArray(order.components) && order.components.length
+      ? { components: order.components.map((component) => ({
+        componentId: component.componentId,
+        name: component.name
+      })) }
+      : {}),
     ...(order.instructions ? { instructions: order.instructions } : {}),
     priority: order.priority,
     status: order.status,
     ...(order.technician ? { technician: order.technician.toString() } : {}),
     ...(order.rejectionReason ? { rejectionReason: order.rejectionReason } : {}),
+    ...(order.cancelledBy ? { cancelledBy: order.cancelledBy.toString() } : {}),
+    ...(order.cancelledAt ? { cancelledAt: order.cancelledAt } : {}),
     orderedAt: order.orderedAt,
     ...(order.completedAt ? { completedAt: order.completedAt } : {})
   };
@@ -189,13 +229,14 @@ async function ensureAudit({ actorId, action, entityType, entityId, partialEntit
 async function createLabOrder(input, user) {
   const doctor = await requireActiveRole(user, 'doctor', 'doctor');
   requireObject(input, 'Lab order input');
-  const allowed = new Set(['encounter', 'testName', 'instructions', 'priority', 'idempotencyKey']);
+  const allowed = new Set(['encounter', 'testName', 'components', 'instructions', 'priority', 'idempotencyKey']);
   rejectUnknownFields(input, allowed, 'Lab order input');
   if (!validObjectId(input.encounter)) throw serviceError('A valid encounter ID is required');
 
   const data = {
     encounterId: String(input.encounter),
     testName: normalizeText(input.testName, 'Test name', 200),
+    components: normalizeComponents(input.components),
     instructions: normalizeText(input.instructions, 'Instructions', 2000, false),
     priority: input.priority === undefined ? 'routine' : normalizeText(input.priority, 'Priority', 20),
     idempotencyKey: normalizeIdempotencyKey(input.idempotencyKey)
@@ -234,6 +275,7 @@ async function createLabOrder(input, user) {
     encounter: encounter._id,
     doctor: doctor.id,
     testName: data.testName,
+    ...(data.components ? { components: data.components } : {}),
     ...(data.instructions ? { instructions: data.instructions } : {}),
     priority: data.priority,
     status: 'pending',
@@ -371,14 +413,107 @@ async function getLabOrderDetails(orderId, user) {
   return serializeTechnicianOrder(order, await loadLabContext(order));
 }
 
+async function cancelLabOrder(input, user) {
+  const doctor = await requireActiveRole(user, 'doctor', 'doctor');
+  requireObject(input, 'Lab order cancellation input');
+  rejectUnknownFields(
+    input,
+    new Set(['encounterId', 'orderId', 'idempotencyKey']),
+    'Lab order cancellation input'
+  );
+  if (!validObjectId(input.encounterId)) throw serviceError('A valid encounter ID is required');
+  if (!validObjectId(input.orderId)) throw serviceError('A valid lab order ID is required');
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
+  const requestHash = crypto.createHash('sha256').update(idempotencyKey).digest('hex');
+
+  let order;
+  try {
+    order = await LabOrder.findById(String(input.orderId))
+      .select('+cancellationRequestHash')
+      .lean();
+  } catch (_) {
+    throw serviceError('Unable to retrieve lab order for cancellation', 500);
+  }
+  if (!order) throw serviceError('Lab order not found', 404);
+  if (String(order.doctor) !== doctor.id) {
+    throw serviceError('Only the doctor who ordered this test may cancel it', 403);
+  }
+
+  const encounter = await loadDoctorEncounter(input.encounterId, doctor);
+  if (String(order.encounter) !== String(encounter._id) ||
+      String(order.patient) !== String(encounter.patient)) {
+    throw serviceError('Lab order does not belong to the specified encounter', 400);
+  }
+
+  if (order.status === 'cancelled') {
+    if (String(order.cancelledBy) !== doctor.id || order.cancellationRequestHash !== requestHash) {
+      throw serviceError('Lab order has already been cancelled', 409);
+    }
+    await ensureAudit({
+      actorId: doctor.id,
+      action: CANCELLATION_AUDIT_ACTION,
+      entityType: ORDER_ENTITY,
+      entityId: order._id,
+      partialEntityId: { name: 'labOrderId', value: order._id.toString() },
+      label: 'Lab order cancellation'
+    });
+    return { ...serializeOrder(order), replayed: true };
+  }
+  if (!CANCELLABLE_STATUSES.includes(order.status)) {
+    throw serviceError('Completed, rejected, or otherwise ineligible lab orders cannot be cancelled', 409);
+  }
+
+  let cancelled;
+  try {
+    cancelled = await LabOrder.findOneAndUpdate(
+      {
+        _id: order._id,
+        encounter: encounter._id,
+        patient: encounter.patient,
+        doctor: doctor.id,
+        status: { $in: CANCELLABLE_STATUSES }
+      },
+      {
+        $set: {
+          status: 'cancelled',
+          cancelledBy: doctor.id,
+          cancelledAt: new Date(),
+          cancellationRequestHash: requestHash
+        }
+      },
+      { new: true, runValidators: true }
+    );
+  } catch (error) {
+    if (error.name === 'ValidationError' || error.name === 'CastError') {
+      throw serviceError('Lab order cancellation data is invalid', 400);
+    }
+    throw serviceError('Unable to cancel lab order', 500);
+  }
+  if (!cancelled) throw serviceError('Lab order is no longer eligible for cancellation', 409);
+
+  await ensureAudit({
+    actorId: doctor.id,
+    action: CANCELLATION_AUDIT_ACTION,
+    entityType: ORDER_ENTITY,
+    entityId: cancelled._id,
+    partialEntityId: { name: 'labOrderId', value: cancelled._id.toString() },
+    label: 'Lab order cancellation'
+  });
+  return serializeOrder(cancelled);
+}
+
 function normalizeLabResult(input) {
   requireObject(input, 'Lab result input');
   const allowed = new Set([
-    'orderId', 'resultType', 'numericValue', 'textValue', 'unit',
+    'orderId', 'componentId', 'resultType', 'numericValue', 'textValue', 'unit',
     'referenceRange', 'notes', 'idempotencyKey'
   ]);
   rejectUnknownFields(input, allowed, 'Lab result input');
   if (!validObjectId(input.orderId)) throw serviceError('A valid lab order ID is required');
+  const componentId = normalizeText(input.componentId, 'Component ID', 80, false)?.toLowerCase();
+  if (componentId && !/^[a-z0-9][a-z0-9._-]*$/.test(componentId)) {
+    throw serviceError('Component ID format is invalid');
+  }
   if (!['numeric', 'text'].includes(input.resultType)) {
     throw serviceError('Result type must be numeric or text');
   }
@@ -435,6 +570,7 @@ function normalizeLabResult(input) {
 
   return {
     orderId: String(input.orderId),
+    ...(componentId ? { componentId } : {}),
     resultType: input.resultType,
     ...(numericValue !== undefined ? { numericValue } : {}),
     ...(textValue !== undefined ? { textValue } : {}),
@@ -450,6 +586,8 @@ function sameResult(result, data, technicianId, patientId) {
   return String(result.labOrder) === data.orderId &&
     String(result.patient) === patientId &&
     String(result.technician) === technicianId &&
+    (result.componentId || 'default') === data.componentId &&
+    (result.componentName || data.componentName) === data.componentName &&
     result.resultType === data.resultType &&
     result.numericValue === data.numericValue &&
     (result.textValue || undefined) === data.textValue &&
@@ -465,6 +603,8 @@ function serializeResult(result) {
     labOrder: result.labOrder.toString(),
     patient: result.patient.toString(),
     technician: result.technician.toString(),
+    ...(result.componentId ? { componentId: result.componentId } : {}),
+    ...(result.componentName ? { componentName: result.componentName } : {}),
     resultType: result.resultType,
     ...(result.numericValue !== undefined ? { numericValue: result.numericValue } : {}),
     ...(result.textValue !== undefined ? { textValue: result.textValue } : {}),
@@ -484,10 +624,40 @@ async function findOrder(orderId) {
   }
 }
 
-async function ensureOrderCompleted(order, technicianId, resultId) {
-  if (order.status === 'completed' && String(order.technician) === technicianId) return order;
+async function ensureOrderProgress(order, technicianId, resultId) {
+  async function allRequiredResultsPresent(orderRecord) {
+    let recordedResults;
+    try {
+      recordedResults = await LabResult.find({ labOrder: orderRecord._id }).select('componentId').lean();
+    } catch (_) {
+      throw serviceError('Unable to verify required lab components', 503, {
+        partialSuccess: true,
+        labResultId: String(resultId),
+        labOrderId: orderRecord._id.toString()
+      });
+    }
+    const recordedComponentIds = new Set(recordedResults.map((result) => (
+      result.componentId ? String(result.componentId).toLowerCase() : 'default'
+    )));
+    return componentsForOrder(orderRecord)
+      .every((component) => recordedComponentIds.has(component.componentId));
+  }
+  const allComponentsHaveResults = await allRequiredResultsPresent(order);
+
+  if (order.status === 'completed') {
+    if (String(order.technician) === technicianId && allComponentsHaveResults) return order;
+    throw serviceError('Completed lab order has incomplete component results', 409, {
+      labResultId: String(resultId),
+      labOrderId: order._id.toString()
+    });
+  }
   if (!ORDER_RESULTABLE_STATUSES.includes(order.status) || !technicianCanAccess(order, technicianId)) {
     throw serviceError('This lab order is not eligible for result recording', 409);
+  }
+  const update = { technician: technicianId };
+  if (allComponentsHaveResults) {
+    update.status = 'completed';
+    update.completedAt = new Date();
   }
   let updated;
   try {
@@ -497,27 +667,106 @@ async function ensureOrderCompleted(order, technicianId, resultId) {
         status: { $in: ORDER_RESULTABLE_STATUSES },
         $or: [{ technician: null }, { technician: technicianId }]
       },
-      { $set: { status: 'completed', technician: technicianId, completedAt: new Date() } },
+      { $set: update },
       { new: true, runValidators: true }
     );
   } catch (_) {
     throw serviceError('Unable to complete lab order', 500, { resultId: String(resultId) });
   }
-  if (!updated) throw serviceError('This lab order is no longer eligible for result recording', 409, { resultId: String(resultId) });
+  if (!updated) {
+    // Another component submission may have completed the order after this
+    // request read its previous status. Recheck before treating that race as a
+    // conflict or removing this request's valid component result.
+    let latestOrder;
+    try {
+      latestOrder = await LabOrder.findById(order._id).lean();
+    } catch (_) {
+      throw serviceError('Unable to verify lab order completion', 503, {
+        partialSuccess: true,
+        labResultId: String(resultId),
+        labOrderId: order._id.toString()
+      });
+    }
+    if (
+      latestOrder &&
+      latestOrder.status === 'completed' &&
+      String(latestOrder.technician) === technicianId &&
+      await allRequiredResultsPresent(latestOrder)
+    ) {
+      return latestOrder;
+    }
+    throw serviceError('This lab order is no longer eligible for result recording', 409, {
+      resultId: String(resultId)
+    });
+  }
   return updated;
+}
+
+async function claimLabOrderForTechnician(order, technicianId) {
+  if (!ORDER_RESULTABLE_STATUSES.includes(order.status)) {
+    throw serviceError('This lab order is not eligible for result recording', 409);
+  }
+  if (!technicianCanAccess(order, technicianId)) {
+    throw serviceError('This lab order is assigned to another technician', 403);
+  }
+  if (String(order.technician) === technicianId) return order;
+
+  let claimed;
+  try {
+    claimed = await LabOrder.findOneAndUpdate(
+      {
+        _id: order._id,
+        status: { $in: ORDER_RESULTABLE_STATUSES },
+        $or: [{ technician: null }, { technician: technicianId }]
+      },
+      { $set: { technician: technicianId } },
+      { new: true, runValidators: true }
+    );
+  } catch (_) {
+    throw serviceError('Unable to assign lab order to technician', 500);
+  }
+  if (claimed) return claimed;
+
+  const current = await findOrder(order._id);
+  if (current && ORDER_RESULTABLE_STATUSES.includes(current.status) &&
+      String(current.technician) === technicianId) {
+    return current;
+  }
+  throw serviceError('This lab order is no longer available for result recording', 409);
 }
 
 async function recordLabResult(input, user) {
   const technician = await loadActiveTechnician(user);
   const data = normalizeLabResult(input);
-  const order = await findOrder(data.orderId);
+  let order = await findOrder(data.orderId);
   if (!order) throw serviceError('Lab order not found', 404);
   if (!technicianCanAccess(order, technician.id)) {
     throw serviceError('This lab order is assigned to another technician', 403);
   }
   if (!validObjectId(order.patient)) throw serviceError('Lab order patient reference is invalid', 500);
   const context = await loadLabContext(order);
-  const resultId = deterministicId('lab-result', technician.id, data.orderId, data.idempotencyKey);
+  const requiredComponents = componentsForOrder(order);
+  let component;
+  if (Array.isArray(order.components) && order.components.length > 0) {
+    if (!data.componentId) {
+      throw serviceError('componentId is required for a multi-component lab order');
+    }
+    component = requiredComponents.find((entry) => entry.componentId === data.componentId);
+    if (!component) throw serviceError('Component is not defined for this lab order', 400);
+  } else {
+    if (data.componentId && data.componentId !== 'default') {
+      throw serviceError('Component is not defined for this lab order', 400);
+    }
+    component = requiredComponents[0];
+  }
+  data.componentId = component.componentId;
+  data.componentName = component.name;
+  const resultId = deterministicId(
+    'lab-result',
+    technician.id,
+    data.componentId === 'default' ? data.orderId : `${data.orderId}:${data.componentId}`,
+    data.idempotencyKey
+  );
 
   let existing;
   try {
@@ -529,7 +778,7 @@ async function recordLabResult(input, user) {
     if (!sameResult(existing, data, technician.id, String(order.patient))) {
       throw serviceError('This idempotencyKey was already used for a different lab result', 409);
     }
-    await ensureOrderCompleted(order, technician.id, existing._id);
+    await ensureOrderProgress(order, technician.id, existing._id);
     await ensureAudit({
       actorId: technician.id,
       action: RESULT_AUDIT_ACTION,
@@ -540,15 +789,34 @@ async function recordLabResult(input, user) {
     });
     return { result: serializeResult(existing), orderId: order._id.toString(), replayed: true };
   }
+  let existingComponent;
+  try {
+    const componentFilter = data.componentId === 'default'
+      ? {
+        labOrder: order._id,
+        $or: [{ componentId: 'default' }, { componentId: { $exists: false } }]
+      }
+      : { labOrder: order._id, componentId: data.componentId };
+    existingComponent = await LabResult.findOne(componentFilter).select('_id').lean();
+  } catch (_) {
+    throw serviceError('Unable to check for a result already recorded for this component', 500);
+  }
+  if (existingComponent) {
+    throw serviceError('A result has already been recorded for this component', 409);
+  }
   if (!ORDER_RESULTABLE_STATUSES.includes(order.status)) {
     throw serviceError('This lab order is not eligible for result recording', 409);
   }
+
+  order = await claimLabOrderForTechnician(order, technician.id);
 
   const result = new LabResult({
     _id: resultId,
     labOrder: order._id,
     patient: order.patient,
     technician: technician.id,
+    componentId: data.componentId,
+    componentName: data.componentName,
     resultType: data.resultType,
     ...(data.numericValue !== undefined ? { numericValue: data.numericValue } : {}),
     ...(data.textValue !== undefined ? { textValue: data.textValue } : {}),
@@ -564,7 +832,7 @@ async function recordLabResult(input, user) {
     if (error.code === 11000) {
       const concurrent = await LabResult.findById(resultId).lean();
       if (concurrent && sameResult(concurrent, data, technician.id, String(order.patient))) {
-        await ensureOrderCompleted(order, technician.id, concurrent._id);
+        await ensureOrderProgress(order, technician.id, concurrent._id);
         await ensureAudit({
           actorId: technician.id,
           action: RESULT_AUDIT_ACTION,
@@ -584,7 +852,7 @@ async function recordLabResult(input, user) {
   }
 
   try {
-    await ensureOrderCompleted(order, technician.id, result._id);
+    await ensureOrderProgress(order, technician.id, result._id);
   } catch (error) {
     try {
       await LabResult.deleteOne({ _id: result._id });
@@ -674,6 +942,7 @@ module.exports = {
   createLabOrder,
   listPendingLabOrders,
   getLabOrderDetails,
+  cancelLabOrder,
   recordLabResult,
   rejectLabSample
 };

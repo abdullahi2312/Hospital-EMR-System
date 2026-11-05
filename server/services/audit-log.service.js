@@ -2,6 +2,8 @@ const mongoose = require('mongoose');
 const User = require('../models/User');
 const AuditLog = require('../models/AuditLog');
 
+const PAYMENT_AUDIT_ACTIONS = new Set(['payment_initiated', 'payment_status_changed']);
+
 function createServiceError(message, status) {
   const error = new Error(message);
   error.name = 'AuditLogServiceError';
@@ -30,7 +32,8 @@ async function writeAuditLog({
   entityId,
   details,
   ipAddress,
-  userAgent
+  userAgent,
+  paymentDeduplicationKey
 } = {}) {
   if (!mongoose.isObjectIdOrHexString(actorId)) {
     throw createServiceError('A valid audit actor ID is required', 400);
@@ -38,6 +41,19 @@ async function writeAuditLog({
 
   const normalizedAction = requiredText(action, 'Audit action', 120);
   const normalizedEntityType = requiredText(entityType, 'Audit entity type', 100);
+
+  const isPaymentAudit = normalizedEntityType === 'Payment' && PAYMENT_AUDIT_ACTIONS.has(normalizedAction);
+  if (isPaymentAudit && paymentDeduplicationKey === undefined) {
+    throw createServiceError('Payment audit deduplication key is required', 400);
+  }
+  if (paymentDeduplicationKey !== undefined) {
+    if (typeof paymentDeduplicationKey !== 'string' || !/^[a-f0-9]{64}$/.test(paymentDeduplicationKey)) {
+      throw createServiceError('Payment audit deduplication key is invalid', 400);
+    }
+    if (!isPaymentAudit) {
+      throw createServiceError('Payment deduplication keys are only valid for payment audit events', 400);
+    }
+  }
 
   if (entityId !== undefined && entityId !== null && !mongoose.isObjectIdOrHexString(entityId)) {
     throw createServiceError('A valid audit entity ID is required', 400);
@@ -67,6 +83,7 @@ async function writeAuditLog({
     entityType: normalizedEntityType,
     ...(entityId != null ? { entityId } : {}),
     ...(details !== undefined ? { details } : {}),
+    ...(paymentDeduplicationKey !== undefined ? { paymentDeduplicationKey } : {}),
     ...(ipAddress != null ? { ipAddress } : {}),
     ...(userAgent != null ? { userAgent } : {})
   });
@@ -74,6 +91,34 @@ async function writeAuditLog({
   try {
     await auditLog.save();
   } catch (error) {
+    if (error.code === 11000 && paymentDeduplicationKey !== undefined) {
+      let existing;
+      try {
+        existing = await AuditLog.findOne({ paymentDeduplicationKey })
+          .select('_id actor action entityType entityId createdAt')
+          .lean();
+      } catch (_) {
+        throw createServiceError('Unable to confirm the existing payment audit event', 503);
+      }
+
+      if (existing &&
+          String(existing.actor) === String(actor._id) &&
+          existing.action === normalizedAction &&
+          existing.entityType === normalizedEntityType &&
+          String(existing.entityId || '') === String(entityId || '')) {
+        return {
+          id: existing._id.toString(),
+          actor: actor._id.toString(),
+          action: normalizedAction,
+          entityType: normalizedEntityType,
+          ...(existing.entityId ? { entityId: existing.entityId.toString() } : {}),
+          createdAt: existing.createdAt,
+          deduplicated: true
+        };
+      }
+
+      throw createServiceError('Payment audit deduplication key conflicts with another event', 409);
+    }
     if (error.name === 'ValidationError' || error.name === 'StrictModeError' || error.name === 'CastError') {
       throw createServiceError('Audit log data is invalid', 400);
     }

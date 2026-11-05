@@ -3,13 +3,14 @@ const {
   createLabOrder,
   listPendingLabOrders,
   getLabOrderDetails,
+  cancelLabOrder,
   recordLabResult,
   rejectLabSample
 } = require('../services/lab.service');
 
-const ORDER_FIELDS = new Set(['testName', 'instructions', 'priority', 'idempotencyKey']);
+const ORDER_FIELDS = new Set(['testName', 'components', 'instructions', 'priority', 'idempotencyKey']);
 const RESULT_FIELDS = new Set([
-  'resultType', 'numericValue', 'textValue', 'unit', 'referenceRange', 'notes', 'idempotencyKey'
+  'componentId', 'resultType', 'numericValue', 'textValue', 'unit', 'referenceRange', 'notes', 'idempotencyKey'
 ]);
 
 function badRequest(res, message) {
@@ -147,10 +148,34 @@ async function rejectSample(req, res, next) {
   }
 }
 
+async function cancelOrder(req, res, next) {
+  if (!validId(req.params.encounterId)) return badRequest(res, 'A valid encounter ID is required');
+  if (!validId(req.params.orderId)) return badRequest(res, 'A valid lab order ID is required');
+  const validationError = validateBody(req.body, new Set(['idempotencyKey']));
+  if (validationError) return badRequest(res, validationError);
+
+  try {
+    const order = await cancelLabOrder({
+      encounterId: req.params.encounterId,
+      orderId: req.params.orderId,
+      idempotencyKey: req.body.idempotencyKey
+    }, req.user);
+    return res.status(200).json({
+      success: true,
+      message: order.replayed ? 'Previously cancelled lab order returned' : 'Lab order cancelled successfully',
+      data: order
+    });
+  } catch (error) {
+    if (partialSuccess(res, error, ['labOrderId'])) return;
+    return next(error);
+  }
+}
+
 module.exports = {
   createOrder,
   listPending,
   getOrder,
   createResult,
-  rejectSample
+  rejectSample,
+  cancelOrder
 };

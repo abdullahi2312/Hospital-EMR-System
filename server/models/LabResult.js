@@ -39,6 +39,21 @@ const labResultSchema = new mongoose.Schema(
       required: [true, 'Technician is required'],
       index: true
     },
+    // Optional for compatibility with historical single-result documents.
+    componentId: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      minlength: [1, 'Component ID cannot be empty'],
+      maxlength: [80, 'Component ID cannot exceed 80 characters'],
+      match: [/^[a-z0-9][a-z0-9._-]*$/, 'Component ID format is invalid']
+    },
+    componentName: {
+      type: String,
+      trim: true,
+      minlength: [1, 'Component name cannot be empty'],
+      maxlength: [200, 'Component name cannot exceed 200 characters']
+    },
     resultType: {
       type: String,
       required: [true, 'Result type is required'],
@@ -96,6 +111,15 @@ const labResultSchema = new mongoose.Schema(
   },
   {
     timestamps: true
+  }
+);
+
+labResultSchema.index(
+  { labOrder: 1, componentId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { componentId: { $type: 'string' } },
+    name: 'unique_lab_order_component_result'
   }
 );
 

@@ -37,6 +37,12 @@ encounterRouter.post(
   authorize('doctor'),
   labController.createOrder
 );
+encounterRouter.patch(
+  '/:encounterId/lab-orders/:orderId/cancel',
+  authenticate,
+  authorize('doctor'),
+  labController.cancelOrder
+);
 
 module.exports = router;
 module.exports.encounterRouter = encounterRouter;
