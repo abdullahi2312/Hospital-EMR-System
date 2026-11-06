@@ -4,7 +4,7 @@ const SENSITIVE_DETAIL_KEY = /password|token|secret|clinical.?notes?|emergency.?
 const SENSITIVE_DETAIL_VALUE = /patient|mrn-\d+|diagnos|symptom|allerg|prescription|medication|clinical|emergency|treatment|\b(?:ssn|dob)\b|[\w.+-]+@[\w.-]+\.[a-z]{2,}/i;
 const PHONE_LIKE_VALUE = /(?:\+?\d[\d\s().-]{7,}\d)/;
 
-function isSafeDetailValue(value, depth = 0) {
+function isSafeDetailValue(value, depth = 0, fieldName) {
   if (depth > 5) {
     return false;
   }
@@ -14,6 +14,9 @@ function isSafeDetailValue(value, depth = 0) {
   }
 
   if (typeof value === 'string') {
+    if (fieldName === 'operationHash' || fieldName === 'stockAdditionDeduplicationKey') {
+      return /^[a-f0-9]{64}$/.test(value);
+    }
     return value.length <= 120 &&
       !SENSITIVE_DETAIL_VALUE.test(value) &&
       !PHONE_LIKE_VALUE.test(value) &&
@@ -35,7 +38,7 @@ function isSafeDetailValue(value, depth = 0) {
     !key.startsWith('$') &&
     !key.includes('.') &&
     !SENSITIVE_DETAIL_KEY.test(key) &&
-    isSafeDetailValue(nestedValue, depth + 1)
+    isSafeDetailValue(nestedValue, depth + 1, key)
   ));
 }
 
@@ -94,6 +97,38 @@ const auditLogSchema = new mongoose.Schema(
       select: false,
       match: [/^[a-f0-9]{64}$/, 'Payment audit deduplication key must be a SHA-256 HMAC']
     },
+    patientRegistrationDeduplicationKey: {
+      type: String,
+      immutable: true,
+      select: false,
+      match: [/^[a-f0-9]{64}$/, 'Patient registration audit deduplication key must be a SHA-256 HMAC']
+    },
+    allergyOverride: {
+      type: new mongoose.Schema({
+        patient: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'Patient',
+          required: [true, 'Allergy override patient reference is required'],
+          immutable: true
+        },
+        prescription: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'Prescription',
+          required: [true, 'Allergy override prescription reference is required'],
+          immutable: true
+        },
+        reason: {
+          type: String,
+          required: [true, 'Allergy override reason is required'],
+          trim: true,
+          minlength: [20, 'Allergy override reason must contain at least 20 characters'],
+          maxlength: [1000, 'Allergy override reason cannot exceed 1000 characters'],
+          immutable: true
+        }
+      }, { _id: false, strict: 'throw' }),
+      immutable: true,
+      select: false
+    },
     ipAddress: {
       type: String,
       trim: true,
@@ -142,6 +177,12 @@ auditLogSchema.pre(
 );
 
 auditLogSchema.pre('deleteOne', { document: true, query: false }, rejectAuditLogMutation);
+// bulkWrite bypasses the individual update/delete query middleware above.
+// There are no application bulk-write call sites for audit events, so reject
+// it outright to preserve the append-only contract.
+auditLogSchema.pre('bulkWrite', function rejectAuditLogBulkWrite(next) {
+  return rejectAuditLogMutation(next);
+});
 
 auditLogSchema.index({ actor: 1 }, { name: 'audit_actor' });
 auditLogSchema.index({ action: 1 }, { name: 'audit_action' });
@@ -155,6 +196,43 @@ auditLogSchema.index(
     name: 'unique_payment_audit_deduplication_key'
   }
 );
+auditLogSchema.index(
+  { actor: 1, action: 1, 'details.stockAdditionDeduplicationKey': 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      action: 'inventory_stock_added',
+      'details.stockAdditionDeduplicationKey': { $type: 'string' }
+    },
+    name: 'unique_inventory_stock_addition_audit'
+  }
+);
+auditLogSchema.index(
+  { patientRegistrationDeduplicationKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { patientRegistrationDeduplicationKey: { $type: 'string' } },
+    name: 'unique_patient_registration_audit_deduplication_key'
+  }
+);
+auditLogSchema.index(
+  { 'allergyOverride.prescription': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'allergyOverride.prescription': { $type: 'objectId' } },
+    name: 'unique_prescription_allergy_override_audit'
+  }
+);
+for (const action of ['patient_consent_granted', 'patient_consent_revoked', 'break_glass_activated']) {
+  auditLogSchema.index(
+    { actor: 1, action: 1, entityType: 1, entityId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: { action, entityId: { $type: 'objectId' } },
+      name: `unique_${action}_audit_event`
+    }
+  );
+}
 
 const AuditLog = mongoose.model('AuditLog', auditLogSchema);
 

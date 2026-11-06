@@ -5,8 +5,7 @@ const encounterSchema = new mongoose.Schema(
     patient: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Patient',
-      required: [true, 'Patient is required'],
-      index: true
+      required: [true, 'Patient is required']
     },
     visitNumber: {
       type: String,
@@ -21,8 +20,7 @@ const encounterSchema = new mongoose.Schema(
     },
     assignedDoctor: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      index: true
+      ref: 'User'
     },
     status: {
       type: String,
@@ -81,6 +79,19 @@ const encounterSchema = new mongoose.Schema(
   {
     timestamps: true
   }
+);
+
+// Supports bounded admin encounter analytics filtered by creation time.
+encounterSchema.index({ createdAt: 1 }, { name: 'encounter_analytics_date' });
+// Supports patient portal/timeline and assigned-doctor encounter lists, which
+// filter by owner and sort by the encounter's openedAt timestamp.
+encounterSchema.index(
+  { patient: 1, openedAt: -1, _id: -1 },
+  { name: 'encounters_by_patient_opened_at' }
+);
+encounterSchema.index(
+  { assignedDoctor: 1, openedAt: -1, _id: -1 },
+  { name: 'encounters_by_doctor_opened_at' }
 );
 
 const Encounter = mongoose.model('Encounter', encounterSchema);

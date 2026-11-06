@@ -10,7 +10,20 @@ const { writeAuditLog } = require('./audit-log.service');
 
 const VITAL_AUDIT_ACTION = 'vitals_recorded';
 const VITAL_ENTITY_TYPE = 'Vital';
-const HOURS_IN_MS = 60 * 60 * 1000;
+const VITAL_INPUT_FIELDS = new Set([
+  'patient', 'encounter', 'bloodPressure', 'temperature', 'pulse', 'heartRate',
+  'respiratoryRate', 'weight', 'height', 'oxygenSaturation', 'idempotencyKey'
+]);
+const VITAL_UNITS = Object.freeze({
+  bloodPressure: 'mmHg',
+  heartRate: 'beats/min',
+  pulse: 'beats/min',
+  respiratoryRate: 'breaths/min',
+  temperature: '°C',
+  oxygenSaturation: '%',
+  weight: 'kg',
+  height: 'cm'
+});
 
 function serviceError(message, status = 400, properties = {}) {
   const error = new Error(message);
@@ -55,7 +68,10 @@ function clinicalLimits() {
     weightMin: readLimit('VITAL_MIN_WEIGHT_KG', 0.1, 0.01, 1),
     weightMax: readLimit('VITAL_MAX_WEIGHT_KG', 500, 250, 1000),
     heightMin: readLimit('VITAL_MIN_HEIGHT_CM', 20, 5, 30),
-    heightMax: readLimit('VITAL_MAX_HEIGHT_CM', 300, 250, 350)
+    heightMax: readLimit('VITAL_MAX_HEIGHT_CM', 300, 250, 350),
+    respiratoryRateMin: readLimit('VITAL_MIN_RESPIRATORY_RATE_PER_MIN', 1, 1, 20),
+    respiratoryRateMax: readLimit('VITAL_MAX_RESPIRATORY_RATE_PER_MIN', 100, 30, 150),
+    oxygenSaturationMin: readLimit('VITAL_MIN_SPO2_PERCENT', 1, 1, 50)
   };
   if (
     limits.temperatureMin >= limits.temperatureMax ||
@@ -63,19 +79,45 @@ function clinicalLimits() {
     limits.systolicMin >= limits.systolicMax ||
     limits.diastolicMin >= limits.diastolicMax ||
     limits.weightMin >= limits.weightMax ||
-    limits.heightMin >= limits.heightMax
+    limits.heightMin >= limits.heightMax ||
+    limits.respiratoryRateMin >= limits.respiratoryRateMax
   ) {
     throw serviceError('Vital limit configuration is invalid', 500);
   }
   return limits;
 }
 
+// Configurable adult reference thresholds for flagging only; they are not diagnostic cutoffs.
+function abnormalReferenceThresholds() {
+  const thresholds = {
+    systolicLow: readLimit('VITAL_FLAG_SYSTOLIC_LOW_MMHG', 90, 40, 180),
+    systolicHigh: readLimit('VITAL_FLAG_SYSTOLIC_HIGH_MMHG', 180, 90, 300),
+    diastolicLow: readLimit('VITAL_FLAG_DIASTOLIC_LOW_MMHG', 60, 20, 120),
+    diastolicHigh: readLimit('VITAL_FLAG_DIASTOLIC_HIGH_MMHG', 120, 60, 200),
+    temperatureLow: readLimit('VITAL_FLAG_TEMPERATURE_LOW_C', 36, 30, 40),
+    temperatureHigh: readLimit('VITAL_FLAG_TEMPERATURE_HIGH_C', 38, 35, 45),
+    heartRateLow: readLimit('VITAL_FLAG_HEART_RATE_LOW_BPM', 50, 1, 100),
+    heartRateHigh: readLimit('VITAL_FLAG_HEART_RATE_HIGH_BPM', 120, 50, 300),
+    respiratoryRateLow: readLimit('VITAL_FLAG_RESPIRATORY_RATE_LOW_PER_MIN', 12, 1, 60),
+    respiratoryRateHigh: readLimit('VITAL_FLAG_RESPIRATORY_RATE_HIGH_PER_MIN', 20, 12, 100),
+    oxygenSaturationLow: readLimit('VITAL_FLAG_SPO2_LOW_PERCENT', 92, 50, 99)
+  };
+  if (thresholds.systolicLow >= thresholds.systolicHigh ||
+      thresholds.diastolicLow >= thresholds.diastolicHigh ||
+      thresholds.temperatureLow >= thresholds.temperatureHigh ||
+      thresholds.heartRateLow >= thresholds.heartRateHigh ||
+      thresholds.respiratoryRateLow >= thresholds.respiratoryRateHigh) {
+    throw serviceError('Vital reference threshold configuration is invalid', 500);
+  }
+  return thresholds;
+}
+
 function validateVitalInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw serviceError('Vital input must be an object');
   }
-  if (Object.prototype.hasOwnProperty.call(input, 'respiratoryRate')) {
-    throw serviceError('Respiratory rate is not supported by the current Vital model');
+  if (Object.keys(input).some((field) => !VITAL_INPUT_FIELDS.has(field))) {
+    throw serviceError('Vital input contains unsupported or server-managed fields');
   }
   if (!validObjectId(input.patient)) {
     throw serviceError('A valid patient ID is required');
@@ -89,38 +131,52 @@ function validateVitalInput(input) {
   if (!sourceBloodPressure || typeof sourceBloodPressure !== 'object' || Array.isArray(sourceBloodPressure)) {
     throw serviceError('Blood pressure with systolic and diastolic values is required');
   }
-  const systolic = finiteNumber(sourceBloodPressure.systolic, 'Systolic blood pressure');
-  const diastolic = finiteNumber(sourceBloodPressure.diastolic, 'Diastolic blood pressure');
-  const temperature = finiteNumber(input.temperature, 'Temperature');
+  if (Object.keys(sourceBloodPressure).some((field) => !['systolic', 'diastolic'].includes(field))) {
+    throw serviceError('Blood pressure may contain only systolic and diastolic values');
+  }
+  const systolic = finiteNumber(sourceBloodPressure.systolic, 'Systolic blood pressure (mmHg)');
+  const diastolic = finiteNumber(sourceBloodPressure.diastolic, 'Diastolic blood pressure (mmHg)');
+  const temperature = finiteNumber(input.temperature, 'Temperature (°C)');
   const pulseValue = input.pulse ?? input.heartRate;
   if (input.pulse !== undefined && input.heartRate !== undefined && input.pulse !== input.heartRate) {
     throw serviceError('Pulse and heartRate values must match when both are supplied');
   }
-  const pulse = finiteNumber(pulseValue, 'Pulse');
-  const weight = finiteNumber(input.weight, 'Weight');
-  const height = input.height === undefined ? undefined : finiteNumber(input.height, 'Height');
+  const pulse = finiteNumber(pulseValue, 'Heart rate (beats/min)');
+  const respiratoryRate = input.respiratoryRate === undefined
+    ? undefined
+    : finiteNumber(input.respiratoryRate, 'Respiratory rate (breaths/min)');
+  const weight = finiteNumber(input.weight, 'Weight (kg)');
+  const height = input.height === undefined ? undefined : finiteNumber(input.height, 'Height (cm)');
   const oxygenSaturation = input.oxygenSaturation === undefined
     ? undefined
-    : finiteNumber(input.oxygenSaturation, 'Oxygen saturation');
+    : finiteNumber(input.oxygenSaturation, 'Oxygen saturation (SpO2 %)');
 
-  if (systolic < limits.systolicMin || systolic > limits.systolicMax ||
-      diastolic < limits.diastolicMin || diastolic > limits.diastolicMax || systolic <= diastolic) {
-    throw serviceError('Blood pressure is outside the accepted physiological limits');
+  if (systolic < limits.systolicMin || systolic > limits.systolicMax) {
+    throw serviceError(`Systolic blood pressure must be between ${limits.systolicMin} and ${limits.systolicMax} mmHg`);
+  }
+  if (diastolic < limits.diastolicMin || diastolic > limits.diastolicMax) {
+    throw serviceError(`Diastolic blood pressure must be between ${limits.diastolicMin} and ${limits.diastolicMax} mmHg`);
+  }
+  if (systolic <= diastolic) {
+    throw serviceError('Systolic blood pressure must be greater than diastolic blood pressure');
   }
   if (temperature < limits.temperatureMin || temperature > limits.temperatureMax) {
-    throw serviceError('Temperature is outside the accepted physiological limits');
+    throw serviceError(`Temperature must be between ${limits.temperatureMin} and ${limits.temperatureMax} °C`);
   }
   if (pulse < limits.pulseMin || pulse > limits.pulseMax) {
-    throw serviceError('Pulse is outside the accepted physiological limits');
+    throw serviceError(`Heart rate must be between ${limits.pulseMin} and ${limits.pulseMax} beats per minute`);
   }
   if (weight < limits.weightMin || weight > limits.weightMax) {
-    throw serviceError('Weight is outside the accepted physiological limits');
+    throw serviceError(`Weight must be between ${limits.weightMin} and ${limits.weightMax} kg`);
   }
   if (height !== undefined && (height < limits.heightMin || height > limits.heightMax)) {
-    throw serviceError('Height is outside the accepted physiological limits');
+    throw serviceError(`Height must be between ${limits.heightMin} and ${limits.heightMax} cm`);
   }
-  if (oxygenSaturation !== undefined && (oxygenSaturation < 0 || oxygenSaturation > 100)) {
-    throw serviceError('Oxygen saturation must be between 0 and 100');
+  if (respiratoryRate !== undefined && (respiratoryRate < limits.respiratoryRateMin || respiratoryRate > limits.respiratoryRateMax)) {
+    throw serviceError(`Respiratory rate must be between ${limits.respiratoryRateMin} and ${limits.respiratoryRateMax} breaths per minute`);
+  }
+  if (oxygenSaturation !== undefined && (oxygenSaturation < limits.oxygenSaturationMin || oxygenSaturation > 100)) {
+    throw serviceError(`Oxygen saturation must be between ${limits.oxygenSaturationMin} and 100 percent`);
   }
 
   return {
@@ -129,6 +185,7 @@ function validateVitalInput(input) {
     bloodPressure: { systolic, diastolic },
     temperature,
     pulse,
+    ...(respiratoryRate !== undefined ? { respiratoryRate } : {}),
     weight,
     ...(height !== undefined ? { height } : {}),
     ...(oxygenSaturation !== undefined ? { oxygenSaturation } : {}),
@@ -138,16 +195,23 @@ function validateVitalInput(input) {
 
 function getAbnormalFlags(vital) {
   const flags = [];
+  const thresholds = abnormalReferenceThresholds();
   const bp = vital.bloodPressure;
-  if (bp.systolic < 90) flags.push({ measurement: 'systolic', status: 'low' });
-  if (bp.systolic > 180) flags.push({ measurement: 'systolic', status: 'high' });
-  if (bp.diastolic < 60) flags.push({ measurement: 'diastolic', status: 'low' });
-  if (bp.diastolic > 120) flags.push({ measurement: 'diastolic', status: 'high' });
-  if (vital.temperature < 36) flags.push({ measurement: 'temperature', status: 'low' });
-  if (vital.temperature > 38) flags.push({ measurement: 'temperature', status: 'high' });
-  if (vital.pulse < 50) flags.push({ measurement: 'pulse', status: 'low' });
-  if (vital.pulse > 120) flags.push({ measurement: 'pulse', status: 'high' });
-  if (vital.oxygenSaturation !== undefined && vital.oxygenSaturation < 92) {
+  if (bp.systolic < thresholds.systolicLow) flags.push({ measurement: 'systolic', status: 'low' });
+  if (bp.systolic > thresholds.systolicHigh) flags.push({ measurement: 'systolic', status: 'high' });
+  if (bp.diastolic < thresholds.diastolicLow) flags.push({ measurement: 'diastolic', status: 'low' });
+  if (bp.diastolic > thresholds.diastolicHigh) flags.push({ measurement: 'diastolic', status: 'high' });
+  if (vital.temperature < thresholds.temperatureLow) flags.push({ measurement: 'temperature', status: 'low' });
+  if (vital.temperature > thresholds.temperatureHigh) flags.push({ measurement: 'temperature', status: 'high' });
+  if (vital.pulse < thresholds.heartRateLow) flags.push({ measurement: 'pulse', status: 'low' });
+  if (vital.pulse > thresholds.heartRateHigh) flags.push({ measurement: 'pulse', status: 'high' });
+  if (vital.respiratoryRate !== undefined && vital.respiratoryRate < thresholds.respiratoryRateLow) {
+    flags.push({ measurement: 'respiratoryRate', status: 'low' });
+  }
+  if (vital.respiratoryRate !== undefined && vital.respiratoryRate > thresholds.respiratoryRateHigh) {
+    flags.push({ measurement: 'respiratoryRate', status: 'high' });
+  }
+  if (vital.oxygenSaturation !== undefined && vital.oxygenSaturation < thresholds.oxygenSaturationLow) {
     flags.push({ measurement: 'oxygenSaturation', status: 'low' });
   }
   return flags;
@@ -165,11 +229,14 @@ function serializeVital(vital) {
     },
     temperature: vital.temperature,
     pulse: vital.pulse,
+    heartRate: vital.pulse,
+    ...(vital.respiratoryRate !== undefined ? { respiratoryRate: vital.respiratoryRate } : {}),
     weight: vital.weight,
     ...(vital.height !== undefined ? { height: vital.height } : {}),
     ...(vital.oxygenSaturation !== undefined ? { oxygenSaturation: vital.oxygenSaturation } : {}),
     recordedAt: vital.recordedAt,
-    abnormalFlags: getAbnormalFlags(vital)
+    abnormalFlags: getAbnormalFlags(vital),
+    units: VITAL_UNITS
   };
   return result;
 }
@@ -191,6 +258,7 @@ function sameVitalRequest(vital, data, userId) {
     vital.bloodPressure?.diastolic === data.bloodPressure.diastolic &&
     vital.temperature === data.temperature &&
     vital.pulse === data.pulse &&
+    vital.respiratoryRate === data.respiratoryRate &&
     vital.weight === data.weight &&
     vital.height === data.height &&
     vital.oxygenSaturation === data.oxygenSaturation;
@@ -326,6 +394,7 @@ async function recordVitals(input, user) {
     bloodPressure: data.bloodPressure,
     temperature: data.temperature,
     pulse: data.pulse,
+    ...(data.respiratoryRate !== undefined ? { respiratoryRate: data.respiratoryRate } : {}),
     weight: data.weight,
     ...(data.height !== undefined ? { height: data.height } : {}),
     ...(data.oxygenSaturation !== undefined ? { oxygenSaturation: data.oxygenSaturation } : {}),

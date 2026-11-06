@@ -9,6 +9,8 @@ const {
 const CREATE_FIELDS = new Set([
   'encounterId',
   'receivingHospital',
+  'receivingDepartmentId',
+  'receivingDoctorId',
   'specialist',
   'reason',
   'clinicalSummary',

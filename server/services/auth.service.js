@@ -71,7 +71,7 @@ async function loginUser(username, password) {
     }
   }
 
-  if (!passwordMatches || user.isActive === false) {
+  if (!passwordMatches || user.isActive !== true) {
     throw invalidCredentials();
   }
 

@@ -22,7 +22,9 @@ const INPUT_FIELDS = new Set([
   'duration',
   'quantity',
   'instructions',
-  'idempotencyKey'
+  'idempotencyKey',
+  'overrideAllergyWarning',
+  'allergyOverrideReason'
 ]);
 
 function serviceError(message, status = 400, properties = {}) {
@@ -189,13 +191,15 @@ function sameRequest(prescription, data, doctorId) {
   return String(prescription.encounter) === data.encounterId &&
     String(prescription.patient) === data.patientId &&
     String(prescription.doctor) === doctorId &&
+    String(prescription.medication || '') === data.medicationId &&
     prescription.drugName === data.drugName &&
     prescription.dose === data.dose &&
     prescription.route === data.route &&
     prescription.frequency === data.frequency &&
     prescription.duration === data.duration &&
     prescription.quantity === data.quantity &&
-    (prescription.instructions || undefined) === data.instructions;
+    (prescription.instructions || undefined) === data.instructions &&
+    (prescription.allergyOverrideReason || undefined) === data.allergyOverrideReason;
 }
 
 function serializePrescription(prescription) {
@@ -204,6 +208,7 @@ function serializePrescription(prescription) {
     patient: prescription.patient.toString(),
     encounter: prescription.encounter.toString(),
     doctor: prescription.doctor.toString(),
+    ...(prescription.medication ? { medication: prescription.medication.toString() } : {}),
     drugName: prescription.drugName,
     dose: prescription.dose,
     route: prescription.route,
@@ -250,6 +255,58 @@ async function ensureAudit(prescription, doctorId) {
   }
 }
 
+async function ensureAllergyOverrideAudit(prescription, doctorId) {
+  if (!prescription.allergyOverrideReason) return;
+
+  const expectedReason = prescription.allergyOverrideReason.trim();
+  let existingAudit;
+  try {
+    existingAudit = await AuditLog.findOne({
+      'allergyOverride.prescription': prescription._id
+    }).select('_id actor action entityType entityId +allergyOverride').lean();
+  } catch (_) {
+    throw serviceError('Unable to verify allergy override audit state', 503, {
+      partialSuccess: true,
+      prescriptionId: prescription._id.toString()
+    });
+  }
+
+  if (existingAudit) {
+    const isMatchingAudit = String(existingAudit.actor) === doctorId &&
+      existingAudit.action === 'prescription_allergy_override' &&
+      existingAudit.entityType === ENTITY_TYPE &&
+      String(existingAudit.entityId) === String(prescription._id) &&
+      String(existingAudit.allergyOverride?.patient) === String(prescription.patient) &&
+      String(existingAudit.allergyOverride?.prescription) === String(prescription._id) &&
+      existingAudit.allergyOverride?.reason === expectedReason;
+    if (isMatchingAudit) return;
+    throw serviceError('Prescription was saved, but its allergy override audit could not be verified. Check the audit record before retrying.', 503, {
+      partialSuccess: true,
+      prescriptionId: prescription._id.toString()
+    });
+  }
+
+  try {
+    await writeAuditLog({
+      actorId: doctorId,
+      action: 'prescription_allergy_override',
+      entityType: ENTITY_TYPE,
+      entityId: prescription._id,
+      allergyOverride: {
+        patientId: prescription.patient,
+        prescriptionId: prescription._id,
+        reason: expectedReason
+      }
+    });
+  } catch (_) {
+    throw serviceError(
+      'Prescription was saved, but allergy override audit logging failed. Retry with the same idempotencyKey and override reason to recover it.',
+      503,
+      { partialSuccess: true, prescriptionId: prescription._id.toString() }
+    );
+  }
+}
+
 async function createPrescription(input, user) {
   const doctor = await requireActiveDoctor(user);
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -257,6 +314,17 @@ async function createPrescription(input, user) {
   }
   if (Object.keys(input).some((field) => !INPUT_FIELDS.has(field))) {
     throw serviceError('Prescription input contains unsupported or server-managed fields');
+  }
+  if (input.overrideAllergyWarning !== undefined && typeof input.overrideAllergyWarning !== 'boolean') {
+    throw serviceError('overrideAllergyWarning must be a boolean');
+  }
+  const overrideRequested = input.overrideAllergyWarning === true;
+  const allergyOverrideReason = normalizeText(input.allergyOverrideReason, 'Allergy override reason', 1000, false);
+  if (overrideRequested && (!allergyOverrideReason || allergyOverrideReason.length < 20)) {
+    throw serviceError('Allergy override reason must contain at least 20 characters');
+  }
+  if (!overrideRequested && allergyOverrideReason !== undefined) {
+    throw serviceError('An allergy override reason requires overrideAllergyWarning to be true');
   }
   if (!validObjectId(input.encounter)) throw serviceError('A valid encounter ID is required');
   if (!validObjectId(input.medicationId)) throw serviceError('A valid medication ID is required');
@@ -270,6 +338,7 @@ async function createPrescription(input, user) {
     duration: positiveNumber(input.duration, 'Duration'),
     quantity: positiveNumber(input.quantity, 'Quantity'),
     instructions: normalizeText(input.instructions, 'Instructions', 2000, false),
+    allergyOverrideReason,
     idempotencyKey: normalizeIdempotencyKey(input.idempotencyKey)
   };
   if (!PRESCRIPTION_ROUTES.includes(data.route)) {
@@ -298,7 +367,7 @@ async function createPrescription(input, user) {
     if (error.name === 'PrescriptionServiceError') throw error;
     throw serviceError('Unable to check recorded allergies', 500);
   }
-  if (hasPossibleAllergyMatch) {
+  if (hasPossibleAllergyMatch && !overrideRequested) {
     throw serviceError(
       'Possible allergy match found. Prescription blocked; review the recorded allergy before prescribing.',
       409,
@@ -312,7 +381,7 @@ async function createPrescription(input, user) {
 
   let existing;
   try {
-    existing = await Prescription.findById(prescriptionId).lean();
+    existing = await Prescription.findById(prescriptionId).select('+allergyOverrideReason').lean();
   } catch (_) {
     throw serviceError('Unable to check for a previous prescription submission', 500);
   }
@@ -321,7 +390,12 @@ async function createPrescription(input, user) {
       throw serviceError('This idempotencyKey was already used for a different prescription', 409);
     }
     await ensureAudit(existing, doctor.id);
+    await ensureAllergyOverrideAudit(existing, doctor.id);
     return { ...serializePrescription(existing), replayed: true };
+  }
+
+  if (overrideRequested && !hasPossibleAllergyMatch) {
+    throw serviceError('There is no current allergy warning to override', 409);
   }
 
   const prescription = new Prescription({
@@ -329,6 +403,7 @@ async function createPrescription(input, user) {
     patient: patient._id,
     encounter: encounter._id,
     doctor: doctor.id,
+    medication: medication._id,
     drugName: medication.name,
     dose: data.dose,
     route: data.route,
@@ -336,6 +411,7 @@ async function createPrescription(input, user) {
     duration: data.duration,
     quantity: data.quantity,
     ...(data.instructions ? { instructions: data.instructions } : {}),
+    ...(data.allergyOverrideReason ? { allergyOverrideReason: data.allergyOverrideReason } : {}),
     prescribedAt: new Date()
   });
   try {
@@ -344,12 +420,13 @@ async function createPrescription(input, user) {
     if (error.code === 11000) {
       let concurrent;
       try {
-        concurrent = await Prescription.findById(prescriptionId).lean();
+        concurrent = await Prescription.findById(prescriptionId).select('+allergyOverrideReason').lean();
       } catch (_) {
         throw serviceError('Unable to verify prescription submission', 500);
       }
       if (concurrent && sameRequest(concurrent, data, doctor.id)) {
         await ensureAudit(concurrent, doctor.id);
+        await ensureAllergyOverrideAudit(concurrent, doctor.id);
         return { ...serializePrescription(concurrent), replayed: true };
       }
       throw serviceError('Prescription submission could not be saved safely', 409);
@@ -361,6 +438,7 @@ async function createPrescription(input, user) {
   }
 
   await ensureAudit(prescription, doctor.id);
+  await ensureAllergyOverrideAudit(prescription, doctor.id);
   return serializePrescription(prescription);
 }
 

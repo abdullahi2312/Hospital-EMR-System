@@ -8,7 +8,9 @@ const ALLOWED_FIELDS = new Set([
   'duration',
   'quantity',
   'instructions',
-  'idempotencyKey'
+  'idempotencyKey',
+  'overrideAllergyWarning',
+  'allergyOverrideReason'
 ]);
 
 function badRequest(res, message) {
@@ -26,6 +28,19 @@ async function create(req, res, next) {
   }
   if (Object.keys(body).some((field) => !ALLOWED_FIELDS.has(field))) {
     return badRequest(res, 'Request contains unsupported or server-managed fields');
+  }
+  if (body.overrideAllergyWarning !== undefined && typeof body.overrideAllergyWarning !== 'boolean') {
+    return badRequest(res, 'overrideAllergyWarning must be a boolean');
+  }
+  if (body.overrideAllergyWarning === true && (
+    typeof body.allergyOverrideReason !== 'string' ||
+    body.allergyOverrideReason.trim().length < 20 ||
+    body.allergyOverrideReason.trim().length > 1000
+  )) {
+    return badRequest(res, 'Allergy override reason must contain 20 to 1000 trimmed characters');
+  }
+  if (body.overrideAllergyWarning !== true && body.allergyOverrideReason !== undefined) {
+    return badRequest(res, 'An allergy override reason requires overrideAllergyWarning to be true');
   }
 
   try {

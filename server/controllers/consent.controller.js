@@ -27,7 +27,9 @@ function handleError(error, res, next) {
 
   return res.status(Number(error.status) || 503).json({
     success: false,
-    message: 'The consent change may already have succeeded, but audit logging did not complete. Check the consent record before retrying; retry the same operation only to recover audit logging.',
+    message: error.notificationFailure === true
+      ? 'The consent change succeeded, but its notification may be incomplete. Check the consent record and retry the same operation to recover the notice.'
+      : 'The consent change may already have succeeded, but audit logging did not complete. Check the consent record before retrying; retry the same operation only to recover audit logging.',
     data: {
       partialSuccess: true,
       ...(error.consentId ? { consentId: error.consentId } : {})

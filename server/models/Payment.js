@@ -230,6 +230,8 @@ paymentSchema.index(
   { initiatingUser: 1, idempotencyKey: 1 },
   { unique: true, name: 'unique_payment_idempotency_per_user' }
 );
+// Supports bounded admin payment analytics filtered by payment creation date.
+paymentSchema.index({ createdAt: 1 }, { name: 'payment_analytics_date' });
 
 paymentSchema.pre('validate', function requirePendingInitialState(next) {
   if (this.isNew && this.paymentReference !== this.$locals.serverPaymentReference) {

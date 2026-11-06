@@ -20,6 +20,16 @@ const referralSchema = new mongoose.Schema(
       required: [true, 'Referring doctor is required'],
       index: true
     },
+    receivingDepartment: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Department',
+      index: true
+    },
+    receivingDoctor: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      index: true
+    },
     receivingHospital: {
       type: String,
       required: [true, 'Receiving hospital is required'],
@@ -57,6 +67,27 @@ const referralSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
       index: true
+    },
+    statusHistory: {
+      type: [{
+        status: {
+          type: String,
+          required: true,
+          enum: ['pending', 'accepted', 'completed', 'cancelled']
+        },
+        event: {
+          type: String,
+          required: true,
+          enum: ['created', 'status_changed']
+        },
+        changedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'User',
+          required: true
+        },
+        changedAt: { type: Date, required: true, default: Date.now }
+      }],
+      default: []
     }
   },
   {

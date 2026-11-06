@@ -136,7 +136,7 @@ function resetMocks() {
   vitals.set(String(ids.vital), {
     _id: ids.vital, patient: ids.patient, encounter: ids.encounter, recordedBy: ids.doctor,
     bloodPressure: { systolic: 120, diastolic: 80 }, temperature: 37, pulse: 72, weight: 65,
-    height: 168, oxygenSaturation: 98, recordedAt: now, internalField: 'private'
+    height: 168, oxygenSaturation: 98, respiratoryRate: 16, recordedAt: now, internalField: 'private'
   });
   labOrders.set(String(ids.labOrder), { _id: ids.labOrder, patient: ids.patient, encounter: ids.encounter, testName: 'Complete Blood Count', status: 'completed' });
   labResults.set(String(ids.labResult), {
@@ -204,7 +204,8 @@ test('Patient, Encounter, Observation, and MedicationRequest map to FHIR-style r
   result = await request(port, 'GET', `/api/fhir/Observation/${ids.vital}`, patientToken);
   assert.equal(result.status, 200);
   assert.equal(result.body.resourceType, 'Observation');
-  assert.equal(result.body.component.length, 7);
+  assert.equal(result.body.component.length, 8);
+  assert.ok(result.body.component.some((component) => component.code.coding.some((coding) => coding.code === '9279-1') && component.valueQuantity.value === 16));
   assert.deepEqual(result.body.encounter, { reference: `Encounter/${ids.encounter}` });
   assert.equal(JSON.stringify(result.body).includes('recordedBy'), false);
 

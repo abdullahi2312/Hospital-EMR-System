@@ -106,6 +106,15 @@ const labOrderSchema = new mongoose.Schema(
   }
 );
 
+// Supports bounded admin laboratory-order analytics filtered by order date.
+labOrderSchema.index({ orderedAt: 1 }, { name: 'lab_order_analytics_date' });
+// Supports the technician pending-work queue's status/assignment filter and
+// stable oldest-first ordering.
+labOrderSchema.index(
+  { status: 1, technician: 1, orderedAt: 1, _id: 1 },
+  { name: 'pending_lab_work_queue' }
+);
+
 const LabOrder = mongoose.model('LabOrder', labOrderSchema);
 
 module.exports = LabOrder;

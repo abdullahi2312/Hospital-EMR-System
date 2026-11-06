@@ -1,5 +1,5 @@
 ﻿function notFound(req, _res, next) {
-  const error = new Error(`Route not found: ${req.method} ${req.originalUrl}`);
+  const error = new Error('Route not found');
   error.status = 404;
   next(error);
 }

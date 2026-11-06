@@ -63,6 +63,9 @@ const notificationSchema = new mongoose.Schema(
   }
 );
 
+// Supports recipient-scoped newest-first notification inbox pagination.
+notificationSchema.index({ recipient: 1, createdAt: -1, _id: -1 }, { name: 'recipient_notification_inbox' });
+
 notificationSchema.pre('save', function syncReadAt(next) {
   if (this.isNew || this.isModified('isRead')) {
     if (this.isRead) {

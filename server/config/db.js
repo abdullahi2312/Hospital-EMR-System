@@ -12,7 +12,7 @@ async function connectDB() {
     console.log(`MongoDB connected: ${connection.connection.host}`);
     return connection;
   } catch (error) {
-    console.error(`MongoDB connection failed: ${error.message}`);
+    console.error('MongoDB connection failed');
     throw error;
   }
 }

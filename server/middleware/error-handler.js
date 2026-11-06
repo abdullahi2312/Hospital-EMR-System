@@ -3,7 +3,7 @@
   const message = status === 500 ? 'Internal server error' : error.message;
 
   if (status >= 500) {
-    console.error(error);
+    console.error('Request failed with an internal server error');
   }
 
   res.status(status).json({

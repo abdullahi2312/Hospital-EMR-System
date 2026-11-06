@@ -5,6 +5,8 @@ const ALLOWED_VITAL_FIELDS = new Set([
   'bloodPressure',
   'temperature',
   'pulse',
+  'heartRate',
+  'respiratoryRate',
   'weight',
   'height',
   'oxygenSaturation',
@@ -35,7 +37,7 @@ async function record(req, res, next) {
       Array.isArray(body.bloodPressure) ||
       Object.keys(body.bloodPressure).some((field) => !['systolic', 'diastolic'].includes(field)))
   ) {
-    return badRequest(res, 'Blood pressure may contain only systolic and diastolic values');
+    return badRequest(res, 'Blood pressure may contain only systolic and diastolic values in mmHg');
   }
 
   try {

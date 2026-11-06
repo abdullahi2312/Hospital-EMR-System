@@ -16,7 +16,8 @@ const ALLOWED_PATIENT_FIELDS = new Set([
   'district',
   'emergencyContact',
   'allergies',
-  'allergyStatus'
+  'allergyStatus',
+  'idempotencyKey'
 ]);
 
 function badRequest(res, message) {
@@ -49,7 +50,7 @@ async function register(req, res, next) {
     if (error.name === 'PatientServiceError' && error.partialSuccess === true) {
       return res.status(503).json({
         success: false,
-        message: 'Patient registration may already have succeeded, but audit logging failed. Verify the patient record before retrying.',
+        message: 'Patient registration may already have succeeded, but audit logging failed. Retry the same request with the same idempotencyKey to complete audit recovery without creating another patient.',
         data: null
       });
     }

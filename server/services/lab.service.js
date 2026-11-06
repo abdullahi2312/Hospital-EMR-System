@@ -8,6 +8,7 @@ const Patient = require('../models/Patient');
 const User = require('../models/User');
 const { authorizePatientRecordAccess } = require('./patient-access.service');
 const { writeAuditLog } = require('./audit-log.service');
+const { createNotificationOnce } = require('./notification.service');
 
 const ORDER_AUDIT_ACTION = 'lab_order_created';
 const CANCELLATION_AUDIT_ACTION = 'lab_order_cancelled';
@@ -222,6 +223,28 @@ async function ensureAudit({ actorId, action, entityType, entityId, partialEntit
         partialSuccess: true,
         ...(partialEntityId ? { [partialEntityId.name]: partialEntityId.value } : {})
       }
+    );
+  }
+}
+
+async function ensureLabReadyNotification(order, resultId) {
+  if (order.status !== 'completed') return;
+  try {
+    await createNotificationOnce({
+      recipient: order.doctor,
+      patient: order.patient,
+      type: 'lab_result_ready',
+      title: 'Laboratory results ready',
+      message: 'All required laboratory results are ready for review in the EMR.',
+      relatedModel: 'LabOrder',
+      relatedId: order._id,
+      eventKey: `lab-result-ready:${order._id}`
+    });
+  } catch (_) {
+    throw serviceError(
+      'Lab result may already be recorded, but its notification could not be completed. Retry with the same idempotencyKey.',
+      503,
+      { partialSuccess: true, labResultId: String(resultId), labOrderId: String(order._id) }
     );
   }
 }
@@ -778,7 +801,7 @@ async function recordLabResult(input, user) {
     if (!sameResult(existing, data, technician.id, String(order.patient))) {
       throw serviceError('This idempotencyKey was already used for a different lab result', 409);
     }
-    await ensureOrderProgress(order, technician.id, existing._id);
+    const currentOrder = await ensureOrderProgress(order, technician.id, existing._id);
     await ensureAudit({
       actorId: technician.id,
       action: RESULT_AUDIT_ACTION,
@@ -787,6 +810,7 @@ async function recordLabResult(input, user) {
       partialEntityId: { name: 'labResultId', value: existing._id.toString() },
       label: 'Lab result'
     });
+    await ensureLabReadyNotification(currentOrder, existing._id);
     return { result: serializeResult(existing), orderId: order._id.toString(), replayed: true };
   }
   let existingComponent;
@@ -832,7 +856,7 @@ async function recordLabResult(input, user) {
     if (error.code === 11000) {
       const concurrent = await LabResult.findById(resultId).lean();
       if (concurrent && sameResult(concurrent, data, technician.id, String(order.patient))) {
-        await ensureOrderProgress(order, technician.id, concurrent._id);
+        const currentOrder = await ensureOrderProgress(order, technician.id, concurrent._id);
         await ensureAudit({
           actorId: technician.id,
           action: RESULT_AUDIT_ACTION,
@@ -841,6 +865,7 @@ async function recordLabResult(input, user) {
           partialEntityId: { name: 'labResultId', value: concurrent._id.toString() },
           label: 'Lab result'
         });
+        await ensureLabReadyNotification(currentOrder, concurrent._id);
         return { result: serializeResult(concurrent), orderId: order._id.toString(), replayed: true };
       }
       throw serviceError('Lab result submission could not be saved safely', 409);
@@ -852,7 +877,7 @@ async function recordLabResult(input, user) {
   }
 
   try {
-    await ensureOrderProgress(order, technician.id, result._id);
+    order = await ensureOrderProgress(order, technician.id, result._id);
   } catch (error) {
     try {
       await LabResult.deleteOne({ _id: result._id });
@@ -874,6 +899,7 @@ async function recordLabResult(input, user) {
     partialEntityId: { name: 'labResultId', value: result._id.toString() },
     label: 'Lab result'
   });
+  await ensureLabReadyNotification(order, result._id);
   return { result: serializeResult(result), orderId: order._id.toString() };
 }
 

@@ -39,7 +39,7 @@ async function authenticate(req, res, next) {
       .select('_id fullName username role patient isActive')
       .lean();
 
-    if (!user || user.isActive === false) {
+    if (!user || user.isActive !== true) {
       return unauthorized(res);
     }
 

@@ -8,6 +8,7 @@ const Referral = require('../models/Referral');
 const User = require('../models/User');
 const { authorizePatientRecordAccess } = require('./patient-access.service');
 const { writeAuditLog } = require('./audit-log.service');
+const { createNotificationOnce } = require('./notification.service');
 
 const REFERRAL_CREATE_ACTION = 'referral_created';
 const REFERRAL_STATUS_ACTION = 'referral_status_changed';
@@ -147,19 +148,42 @@ async function authorizeReferralAccess(user, patientId, encounterId) {
   }
 }
 
-async function resolveActiveDepartment(value) {
-  const requested = normalizeText(value, 'Receiving department', 200, true);
+async function resolveActiveDepartment(value, departmentId) {
+  if (departmentId !== undefined && !validObjectId(departmentId)) {
+    throw referralError('A valid receiving department ID is required');
+  }
+  const requested = value === undefined ? undefined : normalizeText(value, 'Receiving department', 200, true);
+  if (!requested && !departmentId) throw referralError('A receiving department is required');
   let department;
   try {
-    department = await Department.findOne({
-      isActive: true,
-      $or: [{ name: requested }, { code: requested.toUpperCase() }]
-    }).select('_id name code').lean();
+    department = departmentId
+      ? await Department.findOne({ _id: departmentId, isActive: true }).select('_id name code').lean()
+      : await Department.findOne({
+        isActive: true,
+        $or: [{ name: requested }, { code: requested.toUpperCase() }]
+      }).select('_id name code').lean();
   } catch (_) {
     throw referralError('Unable to verify receiving department', 500);
   }
   if (!department) throw referralError('Active receiving department was not found', 404);
-  return department.name;
+  if (requested && requested.toLowerCase() !== department.name.toLowerCase() &&
+      requested.toUpperCase() !== department.code) {
+    throw referralError('Receiving department name and ID do not match', 400);
+  }
+  return department;
+}
+
+async function resolveActiveReceivingDoctor(value) {
+  if (value === undefined) return undefined;
+  if (!validObjectId(value)) throw referralError('A valid receiving doctor ID is required');
+  let doctor;
+  try {
+    doctor = await User.findOne({ _id: value, role: 'doctor', isActive: true }).select('_id').lean();
+  } catch (_) {
+    throw referralError('Unable to verify receiving doctor', 500);
+  }
+  if (!doctor) throw referralError('An active receiving doctor was not found', 404);
+  return doctor;
 }
 
 function serializeReferral(referral, replayed = false) {
@@ -168,6 +192,8 @@ function serializeReferral(referral, replayed = false) {
     patient: referral.patient.toString(),
     encounter: referral.encounter.toString(),
     referringDoctor: referral.referringDoctor.toString(),
+    ...(referral.receivingDepartment ? { receivingDepartment: referral.receivingDepartment.toString() } : {}),
+    ...(referral.receivingDoctor ? { receivingDoctor: referral.receivingDoctor.toString() } : {}),
     receivingHospital: referral.receivingHospital,
     ...(referral.specialist ? { specialist: referral.specialist } : {}),
     reason: referral.reason,
@@ -176,6 +202,12 @@ function serializeReferral(referral, replayed = false) {
     referredAt: referral.referredAt,
     createdAt: referral.createdAt,
     updatedAt: referral.updatedAt,
+    statusHistory: (referral.statusHistory || []).map((entry) => ({
+      status: entry.status,
+      event: entry.event,
+      changedBy: entry.changedBy.toString(),
+      changedAt: entry.changedAt
+    })),
     ...(replayed ? { replayed: true } : {})
   };
 }
@@ -183,7 +215,10 @@ function serializeReferral(referral, replayed = false) {
 function sameReferral(referral, input) {
   return String(referral.encounter) === input.encounterId &&
     String(referral.referringDoctor) === input.doctorId &&
-    referral.receivingHospital === input.receivingHospital &&
+    (referral.receivingDepartment
+      ? String(referral.receivingDepartment) === input.departmentId
+      : referral.receivingHospital === input.receivingHospital) &&
+    String(referral.receivingDoctor || '') === String(input.receivingDoctorId || '') &&
     (referral.specialist || undefined) === input.specialist &&
     referral.reason === input.reason &&
     (referral.clinicalSummary || undefined) === input.clinicalSummary;
@@ -231,6 +266,28 @@ async function ensureAudit(actorId, action, entityId, details, operationHash) {
   }
 }
 
+async function ensureReferralNotification(referral, recipientId, eventKey, message) {
+  if (!recipientId) return;
+  try {
+    await createNotificationOnce({
+      recipient: recipientId,
+      patient: referral.patient,
+      type: 'referral_update',
+      title: 'Referral update',
+      message,
+      relatedModel: 'Referral',
+      relatedId: referral._id,
+      eventKey
+    });
+  } catch (_) {
+    throw referralError(
+      'Referral may already have been saved, but its notification could not be completed. Check the referral before retrying.',
+      503,
+      { partialSuccess: true, referralId: String(referral._id) }
+    );
+  }
+}
+
 async function getReferralById(id) {
   try {
     return await Referral.findById(String(id)).lean();
@@ -250,7 +307,7 @@ async function verifyReferralRelations(referral) {
 async function createReferral(input, user) {
   rejectUnknownFields(
     input,
-    new Set(['encounterId', 'receivingHospital', 'specialist', 'reason', 'clinicalSummary', 'idempotencyKey']),
+    new Set(['encounterId', 'receivingHospital', 'receivingDepartmentId', 'receivingDoctorId', 'specialist', 'reason', 'clinicalSummary', 'idempotencyKey']),
     'Referral input'
   );
   const doctor = await requireActiveUser(user, ['doctor']);
@@ -266,11 +323,14 @@ async function createReferral(input, user) {
   const encounterId = String(encounter._id);
   const patientId = String(encounter.patient);
   await authorizeReferralAccess(doctor, patientId, encounterId);
-  const receivingHospital = await resolveActiveDepartment(input.receivingHospital);
+  const department = await resolveActiveDepartment(input.receivingHospital, input.receivingDepartmentId);
+  const receivingDoctor = await resolveActiveReceivingDoctor(input.receivingDoctorId);
   const normalized = {
     encounterId,
     doctorId: doctor._id.toString(),
-    receivingHospital,
+    receivingHospital: department.name,
+    departmentId: department._id.toString(),
+    receivingDoctorId: receivingDoctor?._id.toString(),
     specialist,
     reason,
     clinicalSummary
@@ -284,6 +344,12 @@ async function createReferral(input, user) {
       throw referralError('This idempotencyKey was already used for a different referral', 409);
     }
     await ensureAudit(doctor._id, REFERRAL_CREATE_ACTION, existing._id, { operationHash }, operationHash);
+    await ensureReferralNotification(
+      existing,
+      existing.receivingDoctor,
+      `referral-created:${existing._id}:recipient:${existing.receivingDoctor || ''}`,
+      'A referral has been sent to you. Review it in the EMR.'
+    );
     return serializeReferral(existing, true);
   }
 
@@ -294,18 +360,27 @@ async function createReferral(input, user) {
       patient: encounter.patient,
       encounter: encounter._id,
       referringDoctor: doctor._id,
-      receivingHospital,
+      receivingHospital: department.name,
+      receivingDepartment: department._id,
+      ...(receivingDoctor ? { receivingDoctor: receivingDoctor._id } : {}),
       ...(specialist ? { specialist } : {}),
       reason,
       ...(clinicalSummary ? { clinicalSummary } : {}),
       status: 'pending',
-      referredAt: new Date()
+      referredAt: new Date(),
+      statusHistory: [{ status: 'pending', event: 'created', changedBy: doctor._id, changedAt: new Date() }]
     });
   } catch (error) {
     if (error.code === 11000) {
       existing = await getReferralById(referralId);
       if (existing && sameReferral(existing, normalized)) {
         await ensureAudit(doctor._id, REFERRAL_CREATE_ACTION, existing._id, { operationHash }, operationHash);
+        await ensureReferralNotification(
+          existing,
+          existing.receivingDoctor,
+          `referral-created:${existing._id}:recipient:${existing.receivingDoctor || ''}`,
+          'A referral has been sent to you. Review it in the EMR.'
+        );
         return serializeReferral(existing, true);
       }
       throw referralError('Referral could not be created safely', 409);
@@ -317,6 +392,12 @@ async function createReferral(input, user) {
   }
 
   await ensureAudit(doctor._id, REFERRAL_CREATE_ACTION, referral._id, { operationHash }, operationHash);
+  await ensureReferralNotification(
+    referral,
+    referral.receivingDoctor,
+    `referral-created:${referral._id}:recipient:${referral.receivingDoctor || ''}`,
+    'A referral has been sent to you. Review it in the EMR.'
+  );
   return serializeReferral(referral);
 }
 
@@ -369,7 +450,7 @@ async function listReferrals(options = {}, user) {
   let referrals;
   try {
     referrals = await Referral.find(filter)
-      .select('_id patient encounter referringDoctor receivingHospital specialist reason clinicalSummary status referredAt createdAt updatedAt')
+      .select('_id patient encounter referringDoctor receivingDepartment receivingDoctor receivingHospital specialist reason clinicalSummary status statusHistory referredAt createdAt updatedAt')
       .sort({ referredAt: -1, _id: -1 })
       .limit(scanLimit)
       .lean();
@@ -426,8 +507,13 @@ async function updateReferralStatus(input, user) {
   const doctor = await requireActiveUser(user, ['doctor']);
   const referral = await getReferralById(input.referralId);
   if (!referral) throw referralError('Referral not found', 404);
-  if (String(referral.referringDoctor) !== String(doctor._id)) {
-    throw referralError('Only the referring doctor may update this referral status', 403);
+  const mayUpdate = referral.receivingDoctor
+    ? (input.status === 'cancelled'
+      ? String(referral.referringDoctor) === String(doctor._id)
+      : String(referral.receivingDoctor) === String(doctor._id))
+    : String(referral.referringDoctor) === String(doctor._id);
+  if (!mayUpdate) {
+    throw referralError('This doctor is not authorized to update the referral status', 403);
   }
   const relations = await verifyReferralRelations(referral);
   await authorizeReferralAccess(doctor, relations.patientId, relations.encounterId);
@@ -435,7 +521,18 @@ async function updateReferralStatus(input, user) {
   const operationHash = hashValue(`${doctor._id}:${referral._id}:${idempotencyKey}:${input.status}`);
   if (referral.status === input.status) {
     const existingAudit = await auditExists(doctor._id, REFERRAL_STATUS_ACTION, referral._id, operationHash);
-    if (existingAudit) return { ...serializeReferral(referral), replayed: true };
+    if (existingAudit) {
+      const recipientId = String(referral.referringDoctor) === String(doctor._id)
+        ? referral.receivingDoctor
+        : referral.referringDoctor;
+      await ensureReferralNotification(
+        referral,
+        recipientId,
+        `referral-status:${referral._id}:${operationHash}`,
+        'A referral status was updated. Review the referral in the EMR.'
+      );
+      return { ...serializeReferral(referral), replayed: true };
+    }
     const pending = pendingStatusAudits.get(operationHash);
     if (pending) {
       await ensureAudit(
@@ -444,6 +541,15 @@ async function updateReferralStatus(input, user) {
         referral._id,
         { fromStatus: pending.fromStatus, toStatus: pending.toStatus, operationHash },
         operationHash
+      );
+      const recipientId = String(referral.referringDoctor) === String(doctor._id)
+        ? referral.receivingDoctor
+        : referral.referringDoctor;
+      await ensureReferralNotification(
+        referral,
+        recipientId,
+        `referral-status:${referral._id}:${operationHash}`,
+        'A referral status was updated. Review the referral in the EMR.'
       );
       pendingStatusAudits.delete(operationHash);
       return { ...serializeReferral(referral), replayed: true };
@@ -460,8 +566,19 @@ async function updateReferralStatus(input, user) {
   let updated;
   try {
     updated = await Referral.findOneAndUpdate(
-      { _id: referral._id, referringDoctor: doctor._id, status: referral.status },
-      { $set: { status: input.status } },
+      {
+        _id: referral._id,
+        status: referral.status,
+        ...(referral.receivingDoctor
+          ? input.status === 'cancelled'
+            ? { referringDoctor: doctor._id }
+            : { receivingDoctor: doctor._id }
+          : { referringDoctor: doctor._id })
+      },
+      {
+        $set: { status: input.status },
+        $push: { statusHistory: { status: input.status, event: 'status_changed', changedBy: doctor._id, changedAt: new Date() } }
+      },
       { new: true, runValidators: true }
     ).lean();
   } catch (error) {
@@ -475,6 +592,15 @@ async function updateReferralStatus(input, user) {
   const auditDetails = { fromStatus: referral.status, toStatus: input.status, operationHash };
   pendingStatusAudits.set(operationHash, auditDetails);
   await ensureAudit(doctor._id, REFERRAL_STATUS_ACTION, updated._id, auditDetails, operationHash);
+  const recipientId = String(updated.referringDoctor) === String(doctor._id)
+    ? updated.receivingDoctor
+    : updated.referringDoctor;
+  await ensureReferralNotification(
+    updated,
+    recipientId,
+    `referral-status:${updated._id}:${operationHash}`,
+    'A referral status was updated. Review the referral in the EMR.'
+  );
   pendingStatusAudits.delete(operationHash);
   return serializeReferral(updated);
 }

@@ -183,9 +183,14 @@ function vitalEvent(record) {
       bloodPressure: { systolic: record.bloodPressure.systolic, diastolic: record.bloodPressure.diastolic },
       temperature: record.temperature,
       pulse: record.pulse,
+      ...(record.respiratoryRate !== undefined ? { respiratoryRate: record.respiratoryRate } : {}),
       weight: record.weight,
       ...(record.height !== undefined ? { height: record.height } : {}),
-      ...(record.oxygenSaturation !== undefined ? { oxygenSaturation: record.oxygenSaturation } : {})
+      ...(record.oxygenSaturation !== undefined ? { oxygenSaturation: record.oxygenSaturation } : {}),
+      units: {
+        bloodPressure: 'mmHg', heartRate: 'beats/min', respiratoryRate: 'breaths/min',
+        temperature: '°C', oxygenSaturation: '%', weight: 'kg', height: 'cm'
+      }
     }
   };
 }
@@ -313,7 +318,7 @@ async function loadTimelineEvents(patientId, encounterIds, options) {
   try {
     [encounters, vitals, diagnoses, prescriptions, orders, referrals] = await Promise.all([
       timelineQuery(Encounter, encounterFilter, '_id patient department visitType status chiefComplaint clinicalNotes examinationFindings assessment treatmentPlan followUpInstructions openedAt closedAt', 'openedAt', window),
-      timelineQuery(Vital, { ...baseRelated, ...dateFilters.vital }, '_id patient encounter bloodPressure temperature pulse weight height oxygenSaturation recordedAt', 'recordedAt', window),
+      timelineQuery(Vital, { ...baseRelated, ...dateFilters.vital }, '_id patient encounter bloodPressure temperature pulse respiratoryRate weight height oxygenSaturation recordedAt', 'recordedAt', window),
       timelineQuery(Diagnosis, { ...baseRelated, ...dateFilters.diagnosis }, '_id patient encounter code description isPrimary diagnosedAt', 'diagnosedAt', window),
       timelineQuery(Prescription, { ...baseRelated, ...dateFilters.prescription }, '_id patient encounter drugName dose route frequency duration quantity instructions status prescribedAt', 'prescribedAt', window),
       timelineQuery(LabOrder, { ...baseRelated, ...dateFilters.labOrder }, '_id patient encounter testName components priority status orderedAt completedAt', 'orderedAt', window),

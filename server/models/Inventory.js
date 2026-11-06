@@ -55,7 +55,14 @@ const inventorySchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: [true, 'Last updated by user is required']
-    }
+    },
+    // Durable per-batch replay guards used by stock additions when a
+    // transaction is unavailable. The companion operation record supplies
+    // actor/key uniqueness across all inventory batches.
+    stockAdditionOperations: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'InventoryStockAddition'
+    }]
   },
   {
     timestamps: true

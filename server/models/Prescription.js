@@ -20,6 +20,14 @@ const prescriptionSchema = new mongoose.Schema(
       required: [true, 'Doctor is required'],
       index: true
     },
+    // Optional for backwards compatibility with prescriptions created before
+    // medication references were persisted. New records must set this from
+    // the server-validated Medication catalog entry.
+    medication: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Medication',
+      index: true
+    },
     drugName: {
       type: String,
       required: [true, 'Drug name is required'],
@@ -71,6 +79,14 @@ const prescriptionSchema = new mongoose.Schema(
       trim: true,
       maxlength: [2000, 'Instructions cannot exceed 2000 characters']
     },
+    allergyOverrideReason: {
+      type: String,
+      trim: true,
+      minlength: [20, 'Allergy override reason must contain at least 20 characters'],
+      maxlength: [1000, 'Allergy override reason cannot exceed 1000 characters'],
+      immutable: true,
+      select: false
+    },
     status: {
       type: String,
       enum: {
@@ -94,6 +110,9 @@ const prescriptionSchema = new mongoose.Schema(
     timestamps: true
   }
 );
+
+// Supports bounded admin prescription analytics filtered by prescription date.
+prescriptionSchema.index({ prescribedAt: 1 }, { name: 'prescription_analytics_date' });
 
 const Prescription = mongoose.model('Prescription', prescriptionSchema);
 

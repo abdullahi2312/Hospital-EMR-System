@@ -4,6 +4,7 @@ const AuditLog = require('../models/AuditLog');
 const Dispense = require('../models/Dispense');
 const Encounter = require('../models/Encounter');
 const Inventory = require('../models/Inventory');
+const InventoryStockAddition = require('../models/InventoryStockAddition');
 const Medication = require('../models/Medication');
 const Patient = require('../models/Patient');
 const Prescription = require('../models/Prescription');
@@ -147,58 +148,88 @@ async function getMedicationInventory(medicationId, user) {
   };
 }
 
-async function findStockAdditionAudit(pharmacistId, inventoryId, operationHash) {
+async function findStockAdditionAudit(pharmacistId, inventoryId, operationHash, deduplicationKey) {
   try {
-    return await AuditLog.findOne({
-      actor: pharmacistId,
-      action: STOCK_AUDIT_ACTION,
-      entityType: INVENTORY_ENTITY,
-      entityId: inventoryId,
-      'details.operationHash': operationHash
-    }).select('_id details.quantityAdded').lean();
+    const filter = deduplicationKey
+      ? {
+          actor: pharmacistId,
+          action: STOCK_AUDIT_ACTION,
+          entityType: INVENTORY_ENTITY,
+          entityId: inventoryId,
+          'details.stockAdditionDeduplicationKey': deduplicationKey
+        }
+      : {
+          actor: pharmacistId,
+          action: STOCK_AUDIT_ACTION,
+          entityType: INVENTORY_ENTITY,
+          entityId: inventoryId,
+          'details.operationHash': operationHash
+        };
+    return await AuditLog.findOne(filter).select('_id actor action entityType entityId details.quantityAdded').lean();
   } catch (_) {
     throw serviceError('Unable to verify prior stock addition', 503);
   }
 }
 
-async function addInventoryStock(input, user) {
-  const pharmacist = await requireActivePharmacist(user);
-  rejectUnknownFields(input, new Set(['inventoryId', 'quantity', 'idempotencyKey']), 'Stock addition input');
-  if (!validObjectId(input.inventoryId)) throw serviceError('A valid inventory ID is required');
-  const quantity = positiveQuantity(input.quantity, 'Stock addition quantity');
-  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
-  const operationHash = hashKey(`${pharmacist.id}:${input.inventoryId}:${idempotencyKey}`);
-
-  const previousAddition = await findStockAdditionAudit(
-    pharmacist.id,
-    String(input.inventoryId),
-    operationHash
-  );
-  if (previousAddition) {
-    if (previousAddition.details?.quantityAdded !== quantity) {
-      throw serviceError('This idempotencyKey was already used for a different stock addition', 409);
-    }
-    let currentInventory;
-    try {
-      currentInventory = await Inventory.findById(String(input.inventoryId)).lean();
-    } catch (_) {
-      throw serviceError('Stock addition was recorded, but current inventory could not be retrieved', 503, {
-        partialSuccess: true,
-        inventoryId: String(input.inventoryId)
-      });
-    }
-    if (!currentInventory) throw serviceError('Inventory record not found', 404);
-    return { ...serializeInventory(currentInventory), replayed: true };
-  }
-
-  let inventory;
+async function findStockAdditionOperation(pharmacistId, idempotencyKeyHash) {
   try {
-    inventory = await Inventory.findById(String(input.inventoryId)).select('_id medication unit expiryDate').lean();
+    return await InventoryStockAddition.findOne({ actor: pharmacistId, idempotencyKeyHash })
+      .select('+idempotencyKeyHash +inputFingerprint +legacyOperationHash')
+      .lean();
+  } catch (_) {
+    throw serviceError('Unable to verify prior stock addition', 503);
+  }
+}
+
+async function saveStockAdditionOperation(operation) {
+  try {
+    await operation.save();
+    return operation;
+  } catch (error) {
+    if (error.code !== 11000) {
+      if (error.name === 'ValidationError' || error.name === 'CastError') {
+        throw serviceError('Stock addition data is invalid', 400);
+      }
+      throw serviceError('Unable to record stock addition request', 503);
+    }
+    const existing = await findStockAdditionOperation(
+      String(operation.actor),
+      operation.idempotencyKeyHash
+    );
+    if (!existing) throw serviceError('Unable to confirm the existing stock addition request', 503);
+    return existing;
+  }
+}
+
+async function updateStockAdditionOperation(operation, values) {
+  try {
+    const result = await InventoryStockAddition.updateOne(
+      { _id: operation._id },
+      { $set: values },
+      { runValidators: true }
+    );
+    if ((result.matchedCount ?? result.n ?? 0) === 0) {
+      throw serviceError('Stock addition record could not be updated', 503);
+    }
+    Object.assign(operation, values);
+  } catch (error) {
+    if (error.name === 'PharmacyServiceError') throw error;
+    throw serviceError('Unable to update stock addition record', 503);
+  }
+}
+
+async function loadInventoryForStockAddition(inventoryId) {
+  try {
+    return await Inventory.findById(inventoryId)
+      .select('_id medication unit expiryDate quantity stockAdditionOperations')
+      .lean();
   } catch (_) {
     throw serviceError('Unable to verify inventory record', 500);
   }
-  if (!inventory) throw serviceError('Inventory record not found', 404);
+}
 
+async function verifyStockAdditionTarget(inventory) {
+  if (!inventory) throw serviceError('Inventory record not found', 404);
   let medication;
   try {
     medication = await Medication.findById(String(inventory.medication)).select('_id isActive').lean();
@@ -211,46 +242,222 @@ async function addInventoryStock(input, user) {
   if (!(inventory.expiryDate instanceof Date) || inventory.expiryDate.getTime() <= Date.now()) {
     throw serviceError('Expired inventory cannot receive stock', 409);
   }
-
-  let updated;
-  try {
-    updated = await Inventory.findOneAndUpdate(
-      {
-        _id: inventory._id,
-        medication: medication._id,
-        quantity: { $gte: 0 },
-        expiryDate: { $gt: new Date() }
-      },
-      {
-        $inc: { quantity },
-        $set: { lastUpdatedBy: pharmacist.id }
-      },
-      { new: true, runValidators: true }
-    );
-  } catch (_) {
-    throw serviceError('Unable to add stock', 500);
+  if (!Number.isFinite(inventory.quantity) || inventory.quantity < 0) {
+    throw serviceError('Inventory quantity is invalid', 409);
   }
-  if (!updated) throw serviceError('Inventory changed or expired before stock could be added', 409);
+  return medication;
+}
+
+function hasStockAdditionMarker(inventory, operationId) {
+  return Array.isArray(inventory?.stockAdditionOperations) && inventory.stockAdditionOperations.some(
+    (existingId) => String(existingId) === String(operationId)
+  );
+}
+
+async function ensureStockAdditionAudit(operation, pharmacistId, legacyAudit) {
+  if (legacyAudit || operation.legacyAuditPresent === true || operation.auditCompleted === true) return;
+
+  const existingAudit = await findStockAdditionAudit(
+    pharmacistId,
+    String(operation.inventory),
+    operation.legacyOperationHash,
+    operation.idempotencyKeyHash
+  );
+  if (existingAudit) {
+    if (String(existingAudit.actor) !== pharmacistId ||
+        String(existingAudit.entityId) !== String(operation.inventory) ||
+        existingAudit.details?.quantityAdded !== operation.quantity) {
+      throw serviceError('Stock addition audit record conflicts with the recorded operation', 503, {
+        partialSuccess: true,
+        inventoryId: String(operation.inventory)
+      });
+    }
+    await updateStockAdditionOperation(operation, { auditCompleted: true });
+    return;
+  }
 
   try {
     await writeAuditLog({
-      actorId: pharmacist.id,
+      actorId: pharmacistId,
       action: STOCK_AUDIT_ACTION,
       entityType: INVENTORY_ENTITY,
-      entityId: updated._id,
+      entityId: operation.inventory,
       details: {
-        quantityAdded: quantity,
-        operationHash
+        quantityAdded: operation.quantity,
+        operationHash: operation.legacyOperationHash,
+        stockAdditionDeduplicationKey: operation.idempotencyKeyHash
       }
     });
   } catch (_) {
-    throw serviceError(
-      'Stock was updated, but audit logging failed. Verify the inventory quantity before attempting another addition.',
-      503,
-      { partialSuccess: true, inventoryId: updated._id.toString() }
+    // A unique partial index arbitrates simultaneous audit inserts. The audit
+    // service wraps duplicate-key errors, so verify the winning event by key.
+    const concurrentAudit = await findStockAdditionAudit(
+      pharmacistId,
+      String(operation.inventory),
+      operation.legacyOperationHash,
+      operation.idempotencyKeyHash
+    );
+    if (!concurrentAudit ||
+        String(concurrentAudit.actor) !== pharmacistId ||
+        String(concurrentAudit.entityId) !== String(operation.inventory) ||
+        concurrentAudit.details?.quantityAdded !== operation.quantity) {
+      throw serviceError(
+        'Stock was updated, but audit logging did not complete. Retry with the same idempotencyKey; the stock addition will not be repeated.',
+        503,
+        { partialSuccess: true, inventoryId: String(operation.inventory) }
+      );
+    }
+  }
+  await updateStockAdditionOperation(operation, { auditCompleted: true });
+}
+
+async function recoverLegacyStockAddition(pharmacist, inventoryId, quantity, keyHash, fingerprint, legacyHash) {
+  const legacyAudit = await findStockAdditionAudit(pharmacist.id, inventoryId, legacyHash);
+  if (!legacyAudit) return null;
+  if (legacyAudit.details?.quantityAdded !== quantity) {
+    throw serviceError('This idempotencyKey was already used for a different stock addition', 409);
+  }
+
+  const recovered = new InventoryStockAddition({
+    actor: pharmacist.id,
+    idempotencyKeyHash: keyHash,
+    inputFingerprint: fingerprint,
+    legacyOperationHash: legacyHash,
+    inventory: inventoryId,
+    quantity,
+    status: 'applied',
+    auditCompleted: true,
+    legacyAuditPresent: true
+  });
+  return saveStockAdditionOperation(recovered);
+}
+
+async function addInventoryStock(input, user) {
+  const pharmacist = await requireActivePharmacist(user);
+  rejectUnknownFields(input, new Set(['inventoryId', 'quantity', 'idempotencyKey']), 'Stock addition input');
+  if (!validObjectId(input.inventoryId)) throw serviceError('A valid inventory ID is required');
+  const inventoryId = String(input.inventoryId);
+  const quantity = positiveQuantity(input.quantity, 'Stock addition quantity');
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
+  const idempotencyKeyHash = hashKey(`inventory-stock-addition:${pharmacist.id}:${idempotencyKey}`);
+  const inputFingerprint = hashKey(JSON.stringify({ inventoryId, quantity }));
+  const legacyOperationHash = hashKey(`${pharmacist.id}:${inventoryId}:${idempotencyKey}`);
+
+  let operation = await findStockAdditionOperation(pharmacist.id, idempotencyKeyHash);
+  if (operation) {
+    if (operation.inputFingerprint !== inputFingerprint || String(operation.inventory) !== inventoryId ||
+        operation.quantity !== quantity) {
+      throw serviceError('This idempotencyKey was already used for a different stock addition', 409);
+    }
+  } else {
+    operation = await recoverLegacyStockAddition(
+      pharmacist, inventoryId, quantity, idempotencyKeyHash, inputFingerprint, legacyOperationHash
     );
   }
-  return serializeInventory(updated);
+
+  if (!operation) {
+    const inventory = await loadInventoryForStockAddition(inventoryId);
+    if (!inventory) throw serviceError('Inventory record not found', 404);
+    await verifyStockAdditionTarget(inventory);
+    operation = await saveStockAdditionOperation(new InventoryStockAddition({
+      actor: pharmacist.id,
+      idempotencyKeyHash,
+      inputFingerprint,
+      legacyOperationHash,
+      inventory: inventoryId,
+      quantity,
+      status: 'pending',
+      auditCompleted: false,
+      legacyAuditPresent: false
+    }));
+    if (operation.inputFingerprint !== inputFingerprint || String(operation.inventory) !== inventoryId ||
+        operation.quantity !== quantity) {
+      throw serviceError('This idempotencyKey was already used for a different stock addition', 409);
+    }
+  }
+
+  let inventory = await loadInventoryForStockAddition(inventoryId);
+  if (!inventory) throw serviceError('Inventory record not found', 404);
+  let alreadyApplied = hasStockAdditionMarker(inventory, operation._id);
+
+  if (operation.status === 'applied' && !alreadyApplied && operation.legacyAuditPresent !== true) {
+    throw serviceError('Stock addition state could not be verified safely', 503, {
+      partialSuccess: true,
+      inventoryId
+    });
+  }
+
+  if (!alreadyApplied && operation.legacyAuditPresent !== true) {
+    const medication = await verifyStockAdditionTarget(inventory);
+    let result;
+    try {
+      result = await Inventory.updateOne(
+        {
+          _id: inventory._id,
+          medication: medication._id,
+          quantity: { $gte: 0 },
+          expiryDate: { $gt: new Date() },
+          stockAdditionOperations: { $ne: operation._id }
+        },
+        {
+          $inc: { quantity: operation.quantity },
+          $set: { lastUpdatedBy: pharmacist.id },
+          $addToSet: { stockAdditionOperations: operation._id }
+        },
+        { runValidators: true }
+      );
+    } catch (_) {
+      throw serviceError('Unable to add stock safely', 503, {
+        partialSuccess: true,
+        inventoryId
+      });
+    }
+
+    const matched = result.matchedCount ?? result.n ?? 0;
+    if (matched === 0) {
+      inventory = await loadInventoryForStockAddition(inventoryId);
+      if (!inventory) throw serviceError('Inventory record not found', 404);
+      if (!hasStockAdditionMarker(inventory, operation._id)) {
+        throw serviceError('Inventory changed or expired before stock could be added', 409);
+      }
+      alreadyApplied = true;
+    }
+  }
+
+  if (operation.status !== 'applied') {
+    try {
+      await updateStockAdditionOperation(operation, { status: 'applied' });
+    } catch (_) {
+      throw serviceError(
+        'Stock may already have been updated. Retry with the same idempotencyKey; the stock addition will not be repeated.',
+        503,
+        { partialSuccess: true, inventoryId }
+      );
+    }
+  }
+
+  try {
+    await ensureStockAdditionAudit(operation, pharmacist.id, operation.legacyAuditPresent === true);
+  } catch (error) {
+    if (error.partialSuccess === true) throw error;
+    throw serviceError(
+      'Stock was updated, but audit status could not be confirmed. Retry with the same idempotencyKey; the stock addition will not be repeated.',
+      503,
+      { partialSuccess: true, inventoryId }
+    );
+  }
+
+  try {
+    const currentInventory = await Inventory.findById(inventoryId).lean();
+    if (!currentInventory) throw serviceError('Inventory record not found', 404);
+    return { ...serializeInventory(currentInventory), replayed: alreadyApplied || operation.legacyAuditPresent === true };
+  } catch (error) {
+    if (error.name === 'PharmacyServiceError') throw error;
+    throw serviceError('Stock addition was recorded, but current inventory could not be retrieved', 503, {
+      partialSuccess: true,
+      inventoryId
+    });
+  }
 }
 
 function attachSession(query, session) {
@@ -290,6 +497,24 @@ async function loadPrescriptionContext(prescriptionId, session) {
 }
 
 async function getActiveMedicationForPrescription(prescription, session) {
+  if (prescription.medication) {
+    let medication;
+    try {
+      const query = Medication.findById(prescription.medication)
+        .select('_id name isActive')
+        .lean();
+      medication = await attachSession(query, session);
+    } catch (_) {
+      throw serviceError('Unable to verify prescribed medication', 500);
+    }
+    if (!medication || medication.isActive !== true) {
+      throw serviceError('Active prescribed medication was not found', 409);
+    }
+    return medication;
+  }
+
+  // Legacy prescriptions predate the catalog reference. Keep their existing
+  // name-based resolution, but reject ambiguous matches.
   const normalizedName = typeof prescription.drugName === 'string'
     ? prescription.drugName.normalize('NFKC').trim().toLocaleLowerCase('en')
     : '';
@@ -411,6 +636,14 @@ async function dispensePrescription(input, user) {
 
   if (!DISPENSABLE_STATUSES.includes(context.prescription.status)) {
     throw serviceError('Prescription is not eligible for dispensing', 409);
+  }
+
+  if (!transactionTopologyAvailable()) {
+    throw serviceError(
+      'Dispensing requires MongoDB transactions. Configure a replica set or sharded cluster; no dispense was confirmed.',
+      503,
+      { transactionUnavailable: true }
+    );
   }
 
   let session;
@@ -582,6 +815,13 @@ function isTransactionUnsupported(error) {
   const message = typeof error?.message === 'string' ? error.message : '';
   return error?.code === 20 || error?.codeName === 'IllegalOperation' ||
     /transaction numbers are only allowed|does not support transactions|transactions are not supported/i.test(message);
+}
+
+function transactionTopologyAvailable() {
+  const topologyType = mongoose.connection.client?.topology?.description?.type;
+  // An absent topology occurs in unit mocks; let the normal session path decide there.
+  if (topologyType === undefined || topologyType === null) return true;
+  return topologyType === 'ReplicaSetWithPrimary' || topologyType === 'Sharded';
 }
 
 module.exports = {

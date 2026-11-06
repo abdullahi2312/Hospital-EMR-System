@@ -13,7 +13,7 @@ const { authorizePatientRecordAccess } = require('./patient-access.service');
 const FHIR_ACCESS_REASON = 'FHIR read-only resource access';
 const SAFE_PATIENT_FIELDS = '_id mrn firstName fatherName grandfatherName sex dateOfBirth phone district createdAt updatedAt';
 const SAFE_ENCOUNTER_FIELDS = '_id patient visitNumber department assignedDoctor status visitType chiefComplaint clinicalNotes examinationFindings assessment treatmentPlan followUpInstructions openedAt closedAt createdAt updatedAt';
-const SAFE_VITAL_FIELDS = '_id patient encounter bloodPressure temperature pulse weight height oxygenSaturation recordedAt';
+const SAFE_VITAL_FIELDS = '_id patient encounter bloodPressure temperature pulse respiratoryRate weight height oxygenSaturation recordedAt';
 const SAFE_LAB_RESULT_FIELDS = '_id patient labOrder componentId componentName resultType numericValue textValue unit referenceRange flag resultedAt';
 const SAFE_LAB_ORDER_FIELDS = '_id patient encounter testName status';
 const SAFE_PRESCRIPTION_FIELDS = '_id patient encounter drugName dose route frequency duration quantity instructions status prescribedAt';
@@ -184,6 +184,7 @@ function vitalObservation(vital) {
     { code: { coding: [{ system: 'http://loinc.org', code: '8867-4', display: 'Heart rate' }] }, valueQuantity: quantity(vital.pulse, 'beats/min', '/min') },
     { code: { coding: [{ system: 'http://loinc.org', code: '29463-7', display: 'Body weight' }] }, valueQuantity: quantity(vital.weight, 'kg', 'kg') }
   ];
+  if (vital.respiratoryRate !== undefined) components.push({ code: { coding: [{ system: 'http://loinc.org', code: '9279-1', display: 'Respiratory rate' }] }, valueQuantity: quantity(vital.respiratoryRate, 'breaths/min', '/min') });
   if (vital.height !== undefined) components.push({ code: { coding: [{ system: 'http://loinc.org', code: '8302-2', display: 'Body height' }] }, valueQuantity: quantity(vital.height, 'cm', 'cm') });
   if (vital.oxygenSaturation !== undefined) components.push({ code: { coding: [{ system: 'http://loinc.org', code: '59408-5', display: 'Oxygen saturation in Arterial blood' }] }, valueQuantity: quantity(vital.oxygenSaturation, '%', '%') });
 

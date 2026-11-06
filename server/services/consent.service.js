@@ -4,6 +4,7 @@ const Consent = require('../models/Consent');
 const Patient = require('../models/Patient');
 const User = require('../models/User');
 const { writeAuditLog } = require('./audit-log.service');
+const { createNotificationOnce } = require('./notification.service');
 
 const CONSENT_SCOPE = 'clinical_record';
 const GRANT_ACTION = 'patient_consent_granted';
@@ -136,6 +137,40 @@ async function ensureConsentAudit(actorId, action, consentId) {
   }
 }
 
+async function ensureConsentNotification(consent, event) {
+  let doctor;
+  try {
+    doctor = await User.findById(String(consent.doctor)).select('_id isActive').lean();
+  } catch (_) {
+    throw consentError('Consent changed, but notification status could not be verified', 503, {
+      partialSuccess: true,
+      notificationFailure: true,
+      consentId: String(consent._id)
+    });
+  }
+  if (!doctor || doctor.isActive !== true) return;
+  try {
+    await createNotificationOnce({
+      recipient: doctor._id,
+      patient: consent.patient,
+      type: 'general',
+      title: 'Patient consent updated',
+      message: event === 'granted'
+        ? 'A patient updated access permissions in the EMR.'
+        : 'A patient revoked access permissions. The change is effective immediately.',
+      relatedModel: 'Consent',
+      relatedId: consent._id,
+      eventKey: `patient-consent-${event}:${consent._id}`
+    });
+  } catch (_) {
+    throw consentError('Consent changed, but its notification could not be completed. Retry the same operation to recover the notice.', 503, {
+      partialSuccess: true,
+      notificationFailure: true,
+      consentId: String(consent._id)
+    });
+  }
+}
+
 async function findActiveConsent(patientId, doctorId, scope) {
   try {
     return await Consent.findOne({
@@ -171,6 +206,7 @@ async function grantPatientConsent(input, user) {
   let existing = await findActiveConsent(patientId, doctor._id, scope);
   if (existing) {
     await ensureConsentAudit(account._id, GRANT_ACTION, existing._id);
+    await ensureConsentNotification(existing, 'granted');
     return serializeConsent(existing, true);
   }
 
@@ -188,6 +224,7 @@ async function grantPatientConsent(input, user) {
       existing = await findActiveConsent(patientId, doctor._id, scope);
       if (existing) {
         await ensureConsentAudit(account._id, GRANT_ACTION, existing._id);
+        await ensureConsentNotification(existing, 'granted');
         return serializeConsent(existing, true);
       }
       throw consentError('An active consent already exists for this doctor', 409);
@@ -199,6 +236,7 @@ async function grantPatientConsent(input, user) {
   }
 
   await ensureConsentAudit(account._id, GRANT_ACTION, consent._id);
+  await ensureConsentNotification(consent, 'granted');
   return serializeConsent(consent);
 }
 
@@ -233,6 +271,7 @@ async function revokePatientConsent(consentId, user) {
 
   if (consent.status === 'revoked') {
     await ensureConsentAudit(account._id, REVOKE_ACTION, consent._id);
+    await ensureConsentNotification(consent, 'revoked');
     return serializeConsent(consent, true);
   }
   if (consent.status !== 'granted') {
@@ -277,6 +316,7 @@ async function revokePatientConsent(consentId, user) {
   }
 
   await ensureConsentAudit(account._id, REVOKE_ACTION, revoked._id);
+  await ensureConsentNotification(revoked, 'revoked');
   return serializeConsent(revoked);
 }
 

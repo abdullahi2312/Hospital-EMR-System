@@ -123,6 +123,9 @@ labResultSchema.index(
   }
 );
 
+// Supports bounded admin laboratory-result analytics filtered by result date.
+labResultSchema.index({ resultedAt: 1 }, { name: 'lab_result_analytics_date' });
+
 const LabResult = mongoose.model('LabResult', labResultSchema);
 
 module.exports = LabResult;

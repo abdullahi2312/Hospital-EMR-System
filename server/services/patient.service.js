@@ -1,5 +1,7 @@
+const crypto = require('node:crypto');
 const mongoose = require('mongoose');
 const Patient = require('../models/Patient');
+const PatientRegistrationOperation = require('../models/PatientRegistrationOperation');
 const User = require('../models/User');
 const { writeAuditLog } = require('./audit-log.service');
 
@@ -10,6 +12,8 @@ const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 const MAX_PAGE_NUMBER = 1000000;
+const REGISTRATION_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+const REGISTRATION_LEASE_MS = 60 * 1000;
 
 function createServiceError(message, status, properties = {}) {
   const error = new Error(message);
@@ -169,6 +173,180 @@ function buildPatientInput(input, registeredById) {
   };
 }
 
+function normalizeRegistrationIdempotencyKey(value) {
+  if (typeof value !== 'string') {
+    throw createServiceError('A registration idempotencyKey is required', 400);
+  }
+  const key = value.trim();
+  if (!REGISTRATION_KEY_PATTERN.test(key)) {
+    throw createServiceError('Registration idempotencyKey must be 8 to 128 letters, numbers, or . _ : - characters', 400);
+  }
+  return key;
+}
+
+function identityHmac(value) {
+  const secret = process.env.PATIENT_IDENTITY_HMAC_SECRET;
+  if (typeof secret !== 'string' || Buffer.byteLength(secret, 'utf8') < 32) {
+    throw createServiceError('Patient idempotency protection is not configured', 503);
+  }
+  return crypto.createHmac('sha256', secret).update(value).digest('hex');
+}
+
+function registrationFingerprint(registration) {
+  const data = registration.patientData;
+  const canonical = {
+    firstName: data.firstName.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en'),
+    fatherName: data.fatherName.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en'),
+    grandfatherName: data.grandfatherName.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en'),
+    sex: data.sex,
+    dateOfBirth: registration.dateOfBirth ? registration.dateOfBirth.toISOString().slice(0, 10) : null,
+    estimatedAge: registration.estimatedAge ?? null,
+    phone: registration.phoneKey || null,
+    district: data.district || null,
+    emergencyContact: data.emergencyContact || null,
+    allergies: data.allergies || [],
+    allergyStatus: data.allergyStatus || 'not_recorded'
+  };
+  return identityHmac(`patient-registration-input:${JSON.stringify(canonical)}`);
+}
+
+function registrationKeyHash(actorId, key) {
+  return crypto.createHash('sha256').update(`patient-registration:${actorId}:${key}`).digest('hex');
+}
+
+function registrationAuditKey(actorId, keyHash) {
+  return identityHmac(`patient-registration-audit:${actorId}:${keyHash}`);
+}
+
+function operationSelect(query) {
+  return query
+    .select('+idempotencyKeyHash +inputFingerprint +auditDeduplicationKey +leaseToken')
+    .lean();
+}
+
+async function findRegistrationOperation(actorId, keyHash) {
+  try {
+    return await operationSelect(PatientRegistrationOperation.findOne({ actor: actorId, idempotencyKeyHash: keyHash }));
+  } catch (_) {
+    throw createServiceError('Unable to verify patient registration retry', 503);
+  }
+}
+
+async function createRegistrationOperation(values) {
+  const operation = new PatientRegistrationOperation(values);
+  try {
+    await operation.save();
+    return operation.toObject ? operation.toObject() : operation;
+  } catch (error) {
+    if (error.code !== 11000) {
+      if (error.name === 'ValidationError' || error.name === 'CastError') {
+        throw createServiceError('Patient registration operation is invalid', 400);
+      }
+      throw createServiceError('Unable to reserve patient registration request', 503);
+    }
+    const existing = await findRegistrationOperation(String(values.actor), values.idempotencyKeyHash);
+    if (!existing) throw createServiceError('Unable to confirm patient registration retry', 503);
+    return existing;
+  }
+}
+
+async function updateRegistrationOperation(operation, filter, values) {
+  try {
+    const setValues = { ...values };
+    const update = { $set: setValues };
+    if (setValues.leaseToken === null) {
+      delete setValues.leaseToken;
+      update.$unset = { leaseToken: 1 };
+    }
+    const result = await PatientRegistrationOperation.updateOne(
+      { _id: operation._id, ...filter },
+      update,
+      { runValidators: true }
+    );
+    if ((result.matchedCount ?? result.n ?? 0) === 0) {
+      const latest = await findRegistrationOperation(String(operation.actor), operation.idempotencyKeyHash);
+      if (latest && latest.status === 'created' && String(latest.patient) === String(operation.patient)) {
+        Object.assign(operation, latest);
+        return;
+      }
+      throw createServiceError('Patient registration operation changed; retry with the same idempotencyKey', 409);
+    }
+    Object.assign(operation, values);
+    if (values.leaseToken === null) delete operation.leaseToken;
+  } catch (error) {
+    if (error.name === 'PatientServiceError') throw error;
+    throw createServiceError('Unable to update patient registration retry state', 503);
+  }
+}
+
+async function claimRegistrationOperation(operation) {
+  const now = new Date();
+  const leaseToken = crypto.randomBytes(24).toString('hex');
+  try {
+    const claimQuery = PatientRegistrationOperation.findOneAndUpdate(
+      {
+        _id: operation._id,
+        $or: [
+          { status: 'pending' },
+          { status: 'creating', leaseUntil: { $lte: now } }
+        ]
+      },
+      {
+        $set: {
+          status: 'creating',
+          leaseToken,
+          leaseUntil: new Date(now.getTime() + REGISTRATION_LEASE_MS)
+        }
+      },
+      { new: true, runValidators: true }
+    );
+    const claimed = await operationSelect(claimQuery);
+    if (!claimed) return null;
+    return claimed;
+  } catch (_) {
+    throw createServiceError('Unable to reserve patient registration processing', 503);
+  }
+}
+
+async function loadOperationPatient(patientId) {
+  try {
+    return await Patient.findById(String(patientId))
+      .select('_id mrn firstName fatherName grandfatherName createdAt')
+      .lean();
+  } catch (_) {
+    throw createServiceError('Unable to retrieve the registered patient', 503);
+  }
+}
+
+async function recordPatientRegistrationAudit(operation) {
+  if (operation.auditCompleted === true) return;
+  try {
+    await writeAuditLog({
+      actorId: operation.actor,
+      action: 'patient_registered',
+      entityType: 'Patient',
+      entityId: operation.patient,
+      patientRegistrationDeduplicationKey: operation.auditDeduplicationKey
+    });
+  } catch (_) {
+    throw createServiceError(
+      'Patient registration was saved, but audit logging failed. Retry with the same idempotencyKey to finish audit recovery without creating another patient.',
+      503,
+      { partialSuccess: true, patientCreated: true, auditWritten: false, patientId: String(operation.patient) }
+    );
+  }
+  try {
+    await updateRegistrationOperation(operation, { status: 'created' }, { auditCompleted: true });
+  } catch (_) {
+    // The unique audit key makes this safe to repair on the next retry.
+    throw createServiceError(
+      'Patient registration and audit may already have succeeded. Retry with the same idempotencyKey to verify completion.',
+      503,
+      { partialSuccess: true, patientCreated: true, auditWritten: true, patientId: String(operation.patient) }
+    );
+  }
+}
+
 async function verifyRegistrar(registeredBy) {
   if (!registeredBy || typeof registeredBy !== 'object' || !mongoose.isObjectIdOrHexString(registeredBy.id)) {
     throw createServiceError('A valid authenticated registrar is required', 401);
@@ -301,6 +479,22 @@ function isDuplicateMrnError(error) {
     error.keyPattern?.mrn === 1 ||
     Object.prototype.hasOwnProperty.call(error.keyValue || {}, 'mrn')
   );
+}
+
+const PATIENT_IDENTITY_KEY_FIELDS = [
+  'identityNameDobKey',
+  'identityNameEstimatedAgeKey',
+  'identityPhoneKey'
+];
+
+function isDuplicatePatientIdentityError(error) {
+  if (error?.code !== 11000) return false;
+  const keyPattern = error.keyPattern || {};
+  const keyValue = error.keyValue || {};
+  return PATIENT_IDENTITY_KEY_FIELDS.some((field) => (
+    Object.prototype.hasOwnProperty.call(keyPattern, field) ||
+    Object.prototype.hasOwnProperty.call(keyValue, field)
+  )) || /unique_patient_normalized_(?:name_dob|name_estimated_age|phone)/i.test(error.message || '');
 }
 
 function toSafeRegistrationResult(patient) {
@@ -513,9 +707,83 @@ async function getPatientDetails(patientId, user) {
   return toPatientIdentity(patient);
 }
 
-async function registerPatient(input, registeredBy) {
-  const registrar = await verifyRegistrar(registeredBy);
-  const registration = buildPatientInput(input, registrar._id);
+async function findOperationPatient(operation) {
+  const patient = await loadOperationPatient(operation.patient);
+  return patient;
+}
+
+async function markOperationCreated(operation) {
+  if (operation.status === 'created') return;
+  await updateRegistrationOperation(
+    operation,
+    { status: { $in: ['pending', 'creating'] } },
+    { status: 'created', leaseToken: null, leaseUntil: null, auditCompleted: false }
+  );
+}
+
+async function finishExistingPatientOperation(operation, patient) {
+  if (!patient) throw createServiceError('The patient registration result is unavailable', 503);
+  await markOperationCreated(operation);
+  await recordPatientRegistrationAudit(operation);
+  return toSafeRegistrationResult(patient);
+}
+
+async function waitForRegistrationInProgress(operation, registration) {
+  const maximumAttempts = 40;
+  const pollIntervalMs = 25;
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    const latest = await findRegistrationOperation(String(operation.actor), operation.idempotencyKeyHash);
+    if (!latest) throw createServiceError('Unable to verify patient registration retry', 503);
+    if (latest.inputFingerprint !== operation.inputFingerprint) {
+      throw createServiceError('This idempotencyKey was already used for different patient registration data', 409);
+    }
+    if (latest.status === 'duplicate_rejected') {
+      throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
+    }
+    const patient = await findOperationPatient(latest);
+    if (patient) return finishExistingPatientOperation(latest, patient);
+    if (latest.status === 'created') {
+      throw createServiceError('Patient registration state is inconsistent; retry with the same idempotencyKey', 503);
+    }
+
+    const leaseExpired = latest.status === 'pending' ||
+      (latest.status === 'creating' && (!latest.leaseUntil || new Date(latest.leaseUntil) <= new Date()));
+    if (leaseExpired) return continuePatientRegistration(latest, registration);
+  }
+  throw createServiceError('Patient registration is still processing. Retry with the same idempotencyKey.', 409);
+}
+
+async function continuePatientRegistration(operation, registration) {
+  if (operation.status === 'duplicate_rejected') {
+    throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
+  }
+
+  const existingPatient = await findOperationPatient(operation);
+  if (existingPatient) return finishExistingPatientOperation(operation, existingPatient);
+  if (operation.status === 'created') {
+    throw createServiceError('Patient registration state is inconsistent; retry with the same idempotencyKey', 503);
+  }
+
+  let claimed = operation;
+  if (operation.status !== 'creating' || !operation.leaseUntil || new Date(operation.leaseUntil) <= new Date()) {
+    claimed = await claimRegistrationOperation(operation);
+    if (!claimed) {
+      const latest = await findRegistrationOperation(String(operation.actor), operation.idempotencyKeyHash);
+      if (!latest) throw createServiceError('Unable to verify patient registration retry', 503);
+      const patient = await findOperationPatient(latest);
+      if (patient) return finishExistingPatientOperation(latest, patient);
+      return waitForRegistrationInProgress(latest, registration);
+    }
+  } else {
+    return waitForRegistrationInProgress(operation, registration);
+  }
+
+  const patientAfterClaim = await findOperationPatient(claimed);
+  if (patientAfterClaim) return finishExistingPatientOperation(claimed, patientAfterClaim);
+  if (!registration) {
+    throw createServiceError('Patient registration input is unavailable; retry with the same idempotencyKey', 503);
+  }
 
   let duplicate;
   try {
@@ -523,15 +791,26 @@ async function registerPatient(input, registeredBy) {
   } catch (_) {
     throw createServiceError('Unable to check for duplicate patient records', 500);
   }
-
   if (duplicate) {
+    await updateRegistrationOperation(
+      claimed,
+      { status: 'creating', leaseToken: claimed.leaseToken },
+      { status: 'duplicate_rejected', leaseToken: null, leaseUntil: null }
+    );
     throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
   }
 
-  const patient = new Patient({ ...registration.patientData, mrn: 'MRN-000001' });
+  const patient = new Patient({
+    ...registration.patientData,
+    _id: claimed.patient,
+    mrn: 'MRN-000001'
+  });
   try {
     await patient.validate();
-  } catch (_) {
+  } catch (error) {
+    if (error.name === 'PatientIdentityConfigurationError') {
+      throw createServiceError('Patient duplicate protection is not configured', 503);
+    }
     throw createServiceError('Patient registration data is invalid', 400);
   }
 
@@ -542,40 +821,85 @@ async function registerPatient(input, registeredBy) {
       savedPatient = await patient.save();
       break;
     } catch (error) {
-      if (isDuplicateMrnError(error)) {
-        continue;
+      if (isDuplicatePatientIdentityError(error)) {
+        await updateRegistrationOperation(
+          claimed,
+          { status: 'creating', leaseToken: claimed.leaseToken },
+          { status: 'duplicate_rejected', leaseToken: null, leaseUntil: null }
+        );
+        throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
+      }
+      if (isDuplicateMrnError(error)) continue;
+      if (error.code === 11000) {
+        const alreadySaved = await findOperationPatient(claimed);
+        if (alreadySaved) return finishExistingPatientOperation(claimed, alreadySaved);
       }
       if (error.name === 'ValidationError' || error.name === 'CastError') {
         throw createServiceError('Patient registration data is invalid', 400);
       }
-      throw createServiceError('Unable to register patient', 500);
+      throw createServiceError('Unable to register patient. Retry with the same idempotencyKey.', 503);
     }
   }
 
-  if (!savedPatient) {
-    throw createServiceError('Unable to allocate a unique patient MRN', 503);
-  }
+  if (!savedPatient) throw createServiceError('Unable to allocate a unique patient MRN', 503);
 
-  try {
-    await writeAuditLog({
-      actorId: registrar._id,
-      action: 'patient_registered',
-      entityType: 'Patient',
-      entityId: savedPatient._id
-    });
-  } catch (_) {
-    throw createServiceError(
-      'Patient registration was saved, but audit logging failed. Check for an existing registration before retrying.',
-      503,
-      {
-        partialSuccess: true,
-        patientCreated: true,
-        auditWritten: false
-      }
-    );
-  }
-
+  await updateRegistrationOperation(
+    claimed,
+    { status: 'creating', leaseToken: claimed.leaseToken },
+    { status: 'created', leaseToken: null, leaseUntil: null, auditCompleted: false }
+  );
+  await recordPatientRegistrationAudit(claimed);
   return toSafeRegistrationResult(savedPatient);
+}
+
+async function registerPatient(input, registeredBy) {
+  const registrar = await verifyRegistrar(registeredBy);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw createServiceError('Patient registration input must be an object', 400);
+  }
+  const idempotencyKey = normalizeRegistrationIdempotencyKey(input.idempotencyKey);
+  const registration = buildPatientInput(input, registrar._id);
+  const fingerprint = registrationFingerprint(registration);
+  const keyHash = registrationKeyHash(String(registrar._id), idempotencyKey);
+
+  let operation = await findRegistrationOperation(String(registrar._id), keyHash);
+  if (operation) {
+    if (operation.inputFingerprint !== fingerprint) {
+      throw createServiceError('This idempotencyKey was already used for different patient registration data', 409);
+    }
+    if (operation.status === 'duplicate_rejected') {
+      throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
+    }
+    return continuePatientRegistration(operation, registration);
+  }
+
+  let duplicate;
+  try {
+    duplicate = await findDuplicatePatient(registration);
+  } catch (_) {
+    throw createServiceError('Unable to check for duplicate patient records', 500);
+  }
+  if (duplicate) {
+    throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
+  }
+
+  const operationValues = {
+    actor: registrar._id,
+    idempotencyKeyHash: keyHash,
+    inputFingerprint: fingerprint,
+    auditDeduplicationKey: registrationAuditKey(String(registrar._id), keyHash),
+    patient: new mongoose.Types.ObjectId(),
+    status: 'pending',
+    auditCompleted: false
+  };
+  operation = await createRegistrationOperation(operationValues);
+  if (operation.inputFingerprint !== fingerprint) {
+    throw createServiceError('This idempotencyKey was already used for different patient registration data', 409);
+  }
+  if (operation.status === 'duplicate_rejected') {
+    throw createServiceError('A possible duplicate patient exists; review existing records before registering', 409);
+  }
+  return continuePatientRegistration(operation, registration);
 }
 
 module.exports = {
