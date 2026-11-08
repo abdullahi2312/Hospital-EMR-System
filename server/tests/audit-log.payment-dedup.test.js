@@ -328,3 +328,24 @@ test('existing AuditLog sensitive details validation and append-only schema rema
     /append-only/
   );
 });
+
+test('encounter assignment audit accepts opaque SHA-256 operation keys without weakening sensitive detail checks', async () => {
+  const operationKey = require('node:crypto').createHash('sha256').update('encounter-assignment-test').digest('hex');
+  const event = new AuditLog({
+    actor: actorId,
+    action: 'encounter_doctor_assigned',
+    entityType: 'Encounter',
+    entityId: paymentId,
+    details: { operationKey, changeType: 'assigned' }
+  });
+  await event.validate();
+
+  const malformed = new AuditLog({
+    actor: actorId,
+    action: 'encounter_doctor_assigned',
+    entityType: 'Encounter',
+    entityId: paymentId,
+    details: { operationKey: 'g'.repeat(64), changeType: 'assigned' }
+  });
+  await assert.rejects(malformed.validate(), /Audit details must be a safe metadata object/);
+});

@@ -291,7 +291,7 @@ function referralEvent(record) {
   };
 }
 
-async function loadTimelineEvents(patientId, encounterIds, options) {
+async function loadTimelineEvents(patientId, encounterIds, options, patientView = false) {
   const patientFilter = { patient: patientId };
   const relationFilter = encounterIds ? { encounter: { $in: encounterIds } } : {};
   const window = options.candidateLimit;
@@ -339,7 +339,7 @@ async function loadTimelineEvents(patientId, encounterIds, options) {
   if (encounterIds && encounterIds.length > 0) {
     try {
       allRelatedOrders = await LabOrder.find({ patient: patientId, encounter: { $in: encounterIds } })
-        .select('_id encounter')
+        .select('_id encounter status')
         .limit(MAX_RELATED_LAB_ORDERS + 1)
         .lean();
     } catch (_) {
@@ -370,6 +370,7 @@ async function loadTimelineEvents(patientId, encounterIds, options) {
   }
 
   const encounterByOrder = new Map(allRelatedOrders.map((order) => [String(order._id), String(order.encounter)]));
+  const orderStatusById = new Map(allRelatedOrders.map((order) => [String(order._id), order.status]));
   const events = [
     ...encounters.map(encounterEvent),
     ...filteredVitals.map(vitalEvent),
@@ -377,10 +378,22 @@ async function loadTimelineEvents(patientId, encounterIds, options) {
     ...filteredPrescriptions.map(prescriptionEvent),
     ...filteredOrders.map(labOrderEvent),
     ...results
-      .filter((result) => encounterByOrder.has(String(result.labOrder)))
+      .filter((result) => encounterByOrder.has(String(result.labOrder)) && (!patientView || orderStatusById.get(String(result.labOrder)) === 'completed'))
       .map((result) => labResultEvent(result, encounterByOrder.get(String(result.labOrder)))),
     ...filteredReferrals.map(referralEvent)
   ].filter((event) => event.date instanceof Date && !Number.isNaN(event.date.getTime()));
+  if (patientView) {
+    return events.flatMap((event) => {
+      if (!['encounter', 'lab_result', 'prescription'].includes(event.type)) return [];
+      const details = { ...event.details };
+      if (event.type === 'encounter') {
+        for (const field of ['chiefComplaint', 'clinicalNotes', 'examinationFindings', 'assessment', 'treatmentPlan', 'followUpInstructions']) delete details[field];
+      }
+      if (event.type === 'lab_result') delete details.notes;
+      if (event.type === 'prescription') delete details.instructions;
+      return [{ ...event, details }];
+    });
+  }
   return events;
 }
 
@@ -436,7 +449,7 @@ async function getPatientTimeline(patientId, user, options = {}) {
     authorizedEncounterIds = patientEncounters.map((encounter) => encounter._id);
   }
 
-  const events = await loadTimelineEvents(normalizedPatientId, authorizedEncounterIds, pagination);
+  const events = await loadTimelineEvents(normalizedPatientId, authorizedEncounterIds, pagination, currentUser.role === 'patient');
   events.sort((left, right) => {
     const timeDifference = new Date(right.date).getTime() - new Date(left.date).getTime();
     if (timeDifference !== 0) return timeDifference;

@@ -20,6 +20,20 @@ const ALLOWED_PATIENT_FIELDS = new Set([
   'idempotencyKey'
 ]);
 
+const SAFE_REGISTRATION_ERROR_CODES = new Set([
+  'PATIENT_IDEMPOTENCY_NOT_CONFIGURED',
+  'PATIENT_REGISTRATION_IN_PROGRESS',
+  'PATIENT_REGISTRATION_STATE_CHANGED'
+]);
+
+function registrationErrorData(error) {
+  const data = {};
+  if (SAFE_REGISTRATION_ERROR_CODES.has(error.code)) data.code = error.code;
+  if (error.partialSuccess === true) data.partialSuccess = true;
+  if (error.retrySameKey === true) data.retrySameKey = true;
+  return Object.keys(data).length ? data : null;
+}
+
 function badRequest(res, message) {
   return res.status(400).json({
     success: false,
@@ -51,7 +65,15 @@ async function register(req, res, next) {
       return res.status(503).json({
         success: false,
         message: 'Patient registration may already have succeeded, but audit logging failed. Retry the same request with the same idempotencyKey to complete audit recovery without creating another patient.',
-        data: null
+        data: registrationErrorData(error)
+      });
+    }
+
+    if (error.name === 'PatientServiceError' && registrationErrorData(error)) {
+      return res.status(error.status || 503).json({
+        success: false,
+        message: error.message,
+        data: registrationErrorData(error)
       });
     }
 

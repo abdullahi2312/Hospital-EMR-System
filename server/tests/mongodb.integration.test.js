@@ -336,5 +336,69 @@ test('isolated MongoDB reliability integration suite', { skip: !shouldRun }, asy
     assert.equal((await Inventory.findById(inventory._id).lean()).quantity, 4);
     assert.equal((await Prescription.findById(prescription._id).lean()).status, 'partially_dispensed');
     assert.equal(await Dispense.countDocuments({ prescription: prescription._id }), 1);
+
+    const replay = await dispensePrescription(request, { id: pharmacist._id.toString() });
+    assert.equal(replay.id, result.id);
+    assert.equal(replay.replayed, true);
+    assert.equal((await Inventory.findById(inventory._id).lean()).quantity, 4);
+    assert.equal(await Dispense.countDocuments({ prescription: prescription._id }), 1);
+
+    await assert.rejects(
+      dispensePrescription({ ...request, idempotencyKey: `dispense_insufficient_${runSuffix}` }, { id: pharmacist._id.toString() }),
+      (error) => error.status === 409
+    );
+    assert.equal((await Inventory.findById(inventory._id).lean()).quantity, 4);
+    assert.equal(await Dispense.countDocuments({ prescription: prescription._id }), 1);
+
+    const rollbackInventory = await Inventory.create({
+      medication: medication._id, batchNumber: `rollback-batch-${runSuffix}`, quantity: 5, minimumStock: 1,
+      unit: 'tablets', expiryDate: new Date(Date.now() + 86400000 * 90), lastUpdatedBy: pharmacist._id
+    });
+    const rollbackPrescription = await Prescription.create({
+      patient: patient._id, encounter: encounter._id, doctor: doctor._id,
+      medication: medication._id, drugName: medication.name, dose: '1 unit', route: 'oral', frequency: 'daily', duration: 2, quantity: 2
+    });
+    const originalSave = Dispense.prototype.save;
+    Dispense.prototype.save = async function controlledTransactionFailure() {
+      throw new Error('Controlled failure after inventory decrement');
+    };
+    try {
+      await assert.rejects(
+        dispensePrescription({
+          prescriptionId: rollbackPrescription._id.toString(), inventoryId: rollbackInventory._id.toString(),
+          quantity: 1, idempotencyKey: `dispense_rollback_${runSuffix}`
+        }, { id: pharmacist._id.toString() }),
+        (error) => error.name === 'PharmacyServiceError' && error.status === 500
+      );
+    } finally {
+      Dispense.prototype.save = originalSave;
+    }
+    assert.equal((await Inventory.findById(rollbackInventory._id).lean()).quantity, 5);
+    assert.equal((await Prescription.findById(rollbackPrescription._id).lean()).status, 'pending');
+    assert.equal(await Dispense.countDocuments({ prescription: rollbackPrescription._id }), 0);
+
+    const concurrentInventory = await Inventory.create({
+      medication: medication._id, batchNumber: `concurrent-batch-${runSuffix}`, quantity: 3, minimumStock: 1,
+      unit: 'tablets', expiryDate: new Date(Date.now() + 86400000 * 90), lastUpdatedBy: pharmacist._id
+    });
+    const concurrentPrescription = await Prescription.create({
+      patient: patient._id, encounter: encounter._id, doctor: doctor._id,
+      medication: medication._id, drugName: medication.name, dose: '1 unit', route: 'oral', frequency: 'daily', duration: 3, quantity: 3
+    });
+    const concurrentInput = {
+      prescriptionId: concurrentPrescription._id.toString(), inventoryId: concurrentInventory._id.toString(),
+      quantity: 2, idempotencyKey: `dispense_concurrent_${runSuffix}`
+    };
+    const concurrentRequests = [1, 2].map(() => dispensePrescription(
+      concurrentInput, { id: pharmacist._id.toString() }
+    ).then((value) => ({ value }), (error) => ({ error })));
+    const concurrentOutcomes = await Promise.all(concurrentRequests);
+    assert.equal(concurrentOutcomes.filter((outcome) => outcome.value).length, 2);
+    assert.equal(concurrentOutcomes[0].value.id, concurrentOutcomes[1].value.id);
+    assert.equal(concurrentOutcomes.filter((outcome) => outcome.error).length, 0);
+    assert.equal((await Inventory.findById(concurrentInventory._id).lean()).quantity, 1);
+    assert.equal(await Dispense.countDocuments({ prescription: concurrentPrescription._id }), 1);
+    assert.equal((await Prescription.findById(concurrentPrescription._id).lean()).status, 'partially_dispensed');
+    assert.equal(await AuditLog.countDocuments({ action: 'prescription_dispensed', entityType: 'Dispense' }), 2);
   });
 });

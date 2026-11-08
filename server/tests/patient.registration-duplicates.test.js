@@ -15,6 +15,8 @@ const operations = new Map();
 const auditEvents = [];
 let sequence = 0;
 let failAudit = false;
+let failOperationSave = false;
+let losePatientSaveAcknowledgement = false;
 let generatedKey = 0;
 
 const counterCollection = {
@@ -56,6 +58,7 @@ class MockRegistrationOperation {
   }
 
   async save() {
+    if (failOperationSave) throw new Error('simulated registration-operation database failure');
     const key = `${this.actor}:${this.idempotencyKeyHash}`;
     if (operations.has(key)) {
       const error = new Error('duplicate operation key');
@@ -153,6 +156,10 @@ Patient.prototype.save = async function saveWithMockedUniqueIndexes() {
   this.createdAt ||= new Date();
   this.updatedAt ||= this.createdAt;
   patients.set(String(this._id), this);
+  if (losePatientSaveAcknowledgement) {
+    losePatientSaveAcknowledgement = false;
+    throw new Error('simulated lost acknowledgement after patient save');
+  }
   return this;
 };
 
@@ -183,6 +190,8 @@ test.beforeEach(() => {
   auditEvents.length = 0;
   sequence = 0;
   failAudit = false;
+  failOperationSave = false;
+  losePatientSaveAcknowledgement = false;
   generatedKey = 0;
 });
 
@@ -286,6 +295,44 @@ test('same actor and key with different normalized registration input conflicts'
   assert.equal(sequence, 1);
 });
 
+test('operation-store database failure is retryable with the same key and creates only one patient and MRN', async () => {
+  const key = 'registration-database-retry-key-0001';
+  failOperationSave = true;
+  await assert.rejects(register(patientInput(), key), { status: 503 });
+  assert.equal(patients.size, 0);
+  assert.equal(operations.size, 0);
+  assert.equal(sequence, 0);
+  assert.equal(auditEvents.length, 0);
+
+  failOperationSave = false;
+  const recovered = await register(patientInput(), key);
+  assert.match(recovered.mrn, /^MRN-\d{6}$/);
+  assert.equal(patients.size, 1);
+  assert.equal(operations.size, 1);
+  assert.equal(sequence, 1);
+  assert.equal(auditEvents.length, 1);
+});
+
+test('retry with the same key recovers a patient saved before its response was lost', async () => {
+  const key = 'registration-save-ack-lost-0001';
+  losePatientSaveAcknowledgement = true;
+  await assert.rejects(register(patientInput(), key), (error) => error.status === 503);
+  const [originalPatient] = [...patients.values()];
+  assert.ok(originalPatient);
+  assert.equal(patients.size, 1);
+  assert.equal(operations.size, 1);
+  assert.equal(sequence, 1);
+  assert.equal(auditEvents.length, 0);
+
+  const recovered = await register(patientInput(), key);
+  assert.equal(recovered.id, String(originalPatient._id));
+  assert.equal(recovered.mrn, originalPatient.mrn);
+  assert.equal(patients.size, 1);
+  assert.equal(operations.size, 1);
+  assert.equal(sequence, 1);
+  assert.equal(auditEvents.length, 1);
+});
+
 test('registration idempotency key is required and strictly validated', async () => {
   await assert.rejects(registerPatient(patientInput(), registrar), { status: 400 });
   await assert.rejects(register(patientInput(), 'short'), { status: 400 });
@@ -373,10 +420,15 @@ test('missing HMAC configuration fails safely before a patient is saved', async 
   try {
     await assert.rejects(register(patientInput(), 'missing-secret-key-0001'), (error) => {
       assert.equal(error.status, 503);
+      assert.equal(error.code, 'PATIENT_IDEMPOTENCY_NOT_CONFIGURED');
+      assert.equal(error.retrySameKey, true);
       assert.match(error.message, /idempotency protection is not configured/i);
       return true;
     });
     assert.equal(patients.size, 0);
+    assert.equal(operations.size, 0);
+    assert.equal(sequence, 0);
+    assert.equal(auditEvents.length, 0);
   } finally {
     process.env.PATIENT_IDENTITY_HMAC_SECRET = configuredSecret;
   }

@@ -5,6 +5,8 @@ const { authorize } = require('../middleware/authorize.middleware');
 
 const router = express.Router();
 
+router.get('/prescriptions/pending', authenticate, authorize('pharmacist'), pharmacyController.listPending);
+router.get('/prescriptions/:prescriptionId', authenticate, authorize('pharmacist'), pharmacyController.prescriptionDetails);
 router.get(
   '/inventory/:medicationId',
   authenticate,

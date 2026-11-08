@@ -1,6 +1,6 @@
 'use strict';
 
-require('dotenv').config();
+require('../config/load-env');
 
 const mongoose = require('mongoose');
 const connectDB = require('../config/db');

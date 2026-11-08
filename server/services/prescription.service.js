@@ -349,7 +349,7 @@ async function createPrescription(input, user) {
   let medication;
   try {
     medication = await Medication.findById(data.medicationId)
-      .select('_id name genericName brandName category isActive')
+      .select('_id name genericName brandName category route isActive')
       .lean();
   } catch (_) {
     throw serviceError('Unable to verify medication', 500);

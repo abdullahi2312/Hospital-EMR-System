@@ -187,7 +187,10 @@ function normalizeRegistrationIdempotencyKey(value) {
 function identityHmac(value) {
   const secret = process.env.PATIENT_IDENTITY_HMAC_SECRET;
   if (typeof secret !== 'string' || Buffer.byteLength(secret, 'utf8') < 32) {
-    throw createServiceError('Patient idempotency protection is not configured', 503);
+    throw createServiceError('Patient idempotency protection is not configured', 503, {
+      code: 'PATIENT_IDEMPOTENCY_NOT_CONFIGURED',
+      retrySameKey: true
+    });
   }
   return crypto.createHmac('sha256', secret).update(value).digest('hex');
 }
@@ -269,7 +272,10 @@ async function updateRegistrationOperation(operation, filter, values) {
         Object.assign(operation, latest);
         return;
       }
-      throw createServiceError('Patient registration operation changed; retry with the same idempotencyKey', 409);
+      throw createServiceError('Patient registration operation changed; retry with the same idempotencyKey', 409, {
+        code: 'PATIENT_REGISTRATION_STATE_CHANGED',
+        retrySameKey: true
+      });
     }
     Object.assign(operation, values);
     if (values.leaseToken === null) delete operation.leaseToken;
@@ -751,7 +757,10 @@ async function waitForRegistrationInProgress(operation, registration) {
       (latest.status === 'creating' && (!latest.leaseUntil || new Date(latest.leaseUntil) <= new Date()));
     if (leaseExpired) return continuePatientRegistration(latest, registration);
   }
-  throw createServiceError('Patient registration is still processing. Retry with the same idempotencyKey.', 409);
+  throw createServiceError('Patient registration is still processing. Retry with the same idempotencyKey.', 409, {
+    code: 'PATIENT_REGISTRATION_IN_PROGRESS',
+    retrySameKey: true
+  });
 }
 
 async function continuePatientRegistration(operation, registration) {
@@ -809,7 +818,10 @@ async function continuePatientRegistration(operation, registration) {
     await patient.validate();
   } catch (error) {
     if (error.name === 'PatientIdentityConfigurationError') {
-      throw createServiceError('Patient duplicate protection is not configured', 503);
+      throw createServiceError('Patient idempotency protection is not configured', 503, {
+        code: 'PATIENT_IDEMPOTENCY_NOT_CONFIGURED',
+        retrySameKey: true
+      });
     }
     throw createServiceError('Patient registration data is invalid', 400);
   }

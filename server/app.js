@@ -18,6 +18,8 @@ const referralRoutes = require('./routes/referral.routes');
 const paymentRoutes = require('./routes/payment.routes');
 const fhirRoutes = require('./routes/fhir.routes');
 const notificationRoutes = require('./routes/notification.routes');
+const patientPortalRoutes = require('./routes/patient-portal.routes');
+const departmentRoutes = require('./routes/department.routes');
 const notFound = require('./middleware/not-found');
 const errorHandler = require('./middleware/error-handler');
 const securityHeaders = require('./middleware/security-headers.middleware');
@@ -48,6 +50,8 @@ app.use('/api/referrals', referralRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/fhir', fhirRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/patient-portal', patientPortalRoutes);
+app.use('/api/departments', departmentRoutes);
 app.use(notFound);
 app.use(errorHandler);
 

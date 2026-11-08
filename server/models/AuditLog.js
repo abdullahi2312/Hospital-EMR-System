@@ -14,7 +14,7 @@ function isSafeDetailValue(value, depth = 0, fieldName) {
   }
 
   if (typeof value === 'string') {
-    if (fieldName === 'operationHash' || fieldName === 'stockAdditionDeduplicationKey') {
+    if (fieldName === 'operationHash' || fieldName === 'operationKey' || fieldName === 'stockAdditionDeduplicationKey') {
       return /^[a-f0-9]{64}$/.test(value);
     }
     return value.length <= 120 &&

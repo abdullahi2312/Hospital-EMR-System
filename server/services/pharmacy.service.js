@@ -148,6 +148,288 @@ async function getMedicationInventory(medicationId, user) {
   };
 }
 
+function parsePageNumber(value, fallback, maximum) {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || (maximum && parsed > maximum)) {
+    throw serviceError(maximum ? `Value must be an integer from 1 to ${maximum}` : 'Value must be a positive integer');
+  }
+  return parsed;
+}
+
+function prescriptionProjection(prescription) {
+  const dispenses = prescription.dispensingHistory || [];
+  const alreadyDispensed = dispenses.reduce((sum, row) => sum + Number(row.quantityDispensed || 0), 0);
+  const prescribedQuantity = Number(prescription.quantity);
+  return {
+    id: prescription._id.toString(),
+    patient: prescription.patient,
+    encounter: prescription.encounter,
+    doctor: prescription.doctor,
+    medication: prescription.medication,
+    dose: prescription.dose,
+    route: prescription.route,
+    frequency: prescription.frequency,
+    duration: prescription.duration,
+    quantity: prescribedQuantity,
+    alreadyDispensed,
+    remainingQuantity: Math.max(0, prescribedQuantity - alreadyDispensed),
+    status: prescription.status,
+    prescribedAt: prescription.prescribedAt,
+    dispensingHistory: dispenses.map((row) => ({
+      id: row._id.toString(),
+      quantityDispensed: row.quantityDispensed,
+      unit: row.unit,
+      dispensedAt: row.dispensedAt
+    }))
+  };
+}
+
+function activeMedicationLookup(as) {
+  return {
+    $lookup: {
+      from: Medication.collection.name,
+      let: { medicationId: '$medication', drugName: '$drugName' },
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $and: [
+                { $eq: ['$isActive', true] },
+                {
+                  $or: [
+                    {
+                      $and: [
+                        { $ne: [{ $ifNull: ['$$medicationId', null] }, null] },
+                        { $eq: ['$_id', '$$medicationId'] }
+                      ]
+                    },
+                    {
+                      $and: [
+                        { $eq: [{ $ifNull: ['$$medicationId', null] }, null] },
+                        { $eq: ['$name', { $toLower: { $trim: { input: '$$drugName' } } }] }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        { $limit: 2 },
+        { $project: { _id: 1, name: 1, strength: 1, dosageForm: 1 } }
+      ],
+      as
+    }
+  };
+}
+
+function appendPrescriptionRelations(pipeline, { includeHistory = false } = {}) {
+  pipeline.push(
+    {
+      $lookup: {
+        from: Patient.collection.name,
+        let: { patientId: '$patient' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$patientId'] } } },
+          { $project: { _id: 1, mrn: 1, firstName: 1, fatherName: 1, grandfatherName: 1 } }
+        ],
+        as: 'patientInfo'
+      }
+    },
+    {
+      $lookup: {
+        from: Encounter.collection.name,
+        let: { encounterId: '$encounter' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$encounterId'] } } },
+          { $project: { _id: 1, visitNumber: 1 } }
+        ],
+        as: 'encounterInfo'
+      }
+    },
+    {
+      $lookup: {
+        from: User.collection.name,
+        let: { doctorId: '$doctor' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$_id', '$$doctorId'] } } },
+          { $project: { _id: 1, fullName: 1 } }
+        ],
+        as: 'doctorInfo'
+      }
+    },
+    activeMedicationLookup('medicationInfo'),
+    { $unwind: { path: '$patientInfo', preserveNullAndEmptyArrays: true } },
+    { $unwind: { path: '$encounterInfo', preserveNullAndEmptyArrays: true } },
+    { $unwind: { path: '$doctorInfo', preserveNullAndEmptyArrays: true } },
+    { $unwind: { path: '$medicationInfo', preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        _id: 0,
+        id: { $toString: '$_id' },
+        patient: {
+          id: { $toString: '$patientInfo._id' },
+          mrn: '$patientInfo.mrn',
+          firstName: '$patientInfo.firstName',
+          fatherName: '$patientInfo.fatherName',
+          grandfatherName: '$patientInfo.grandfatherName'
+        },
+        encounter: { id: { $toString: '$encounterInfo._id' }, visitNumber: '$encounterInfo.visitNumber' },
+        doctor: { id: { $toString: '$doctorInfo._id' }, fullName: '$doctorInfo.fullName' },
+        medication: {
+          id: { $cond: [{ $ifNull: ['$medicationInfo._id', false] }, { $toString: '$medicationInfo._id' }, null] },
+          name: { $ifNull: ['$medicationInfo.name', '$drugName'] },
+          strength: '$medicationInfo.strength',
+          dosageForm: '$medicationInfo.dosageForm'
+        },
+        dose: 1,
+        route: 1,
+        frequency: 1,
+        duration: 1,
+        quantity: 1,
+        alreadyDispensed: 1,
+        remainingQuantity: 1,
+        status: 1,
+        prescribedAt: 1,
+        ...(includeHistory ? { dispensingHistory: 1 } : {})
+      }
+    }
+  );
+}
+
+async function listPendingPrescriptions(input = {}, user) {
+  await requireActivePharmacist(user);
+  const page = parsePageNumber(input.page, 1, 1000000);
+  const limit = parsePageNumber(input.limit, 20, 100);
+  const skip = (page - 1) * limit;
+  const pipeline = [
+    { $match: { status: { $in: DISPENSABLE_STATUSES } } },
+    {
+      $lookup: {
+        from: Dispense.collection.name,
+        let: { prescriptionId: '$_id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$prescription', '$$prescriptionId'] } } },
+          { $project: { quantityDispensed: 1 } }
+        ],
+        as: 'dispensingHistory'
+      }
+    },
+    {
+      $addFields: {
+        alreadyDispensed: { $sum: '$dispensingHistory.quantityDispensed' },
+        remainingQuantity: { $subtract: ['$quantity', { $sum: '$dispensingHistory.quantityDispensed' }] }
+      }
+    },
+    { $match: { remainingQuantity: { $gt: 0 } } },
+    activeMedicationLookup('eligibleMedication'),
+    { $match: { $expr: { $eq: [{ $size: '$eligibleMedication' }, 1] } } },
+    {
+      $lookup: {
+        from: Patient.collection.name,
+        let: { patientId: '$patient' },
+        pipeline: [{ $match: { $expr: { $eq: ['$_id', '$$patientId'] } } }, { $limit: 1 }, { $project: { _id: 1 } }],
+        as: 'eligiblePatient'
+      }
+    },
+    {
+      $lookup: {
+        from: Encounter.collection.name,
+        let: { encounterId: '$encounter', patientId: '$patient' },
+        pipeline: [
+          { $match: { $expr: { $and: [{ $eq: ['$_id', '$$encounterId'] }, { $eq: ['$patient', '$$patientId'] }] } } },
+          { $limit: 1 },
+          { $project: { _id: 1 } }
+        ],
+        as: 'eligibleEncounter'
+      }
+    },
+    {
+      $match: {
+        $expr: {
+          $and: [
+            { $eq: [{ $size: '$eligiblePatient' }, 1] },
+            { $eq: [{ $size: '$eligibleEncounter' }, 1] }
+          ]
+        }
+      }
+    },
+    { $sort: { prescribedAt: -1, _id: -1 } },
+    {
+      $facet: {
+        prescriptions: [
+          { $skip: skip },
+          { $limit: limit },
+          ...(() => {
+            const relations = [];
+            appendPrescriptionRelations(relations);
+            return relations;
+          })()
+        ],
+        count: [{ $count: 'total' }]
+      }
+    }
+  ];
+  let result;
+  try {
+    [result] = await Prescription.aggregate(pipeline);
+  } catch (_) {
+    throw serviceError('Unable to retrieve pending prescriptions', 500);
+  }
+  const total = result?.count?.[0]?.total || 0;
+  return { prescriptions: result?.prescriptions || [], pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } };
+}
+
+async function getPharmacistPrescriptionDetails(prescriptionId, user) {
+  await requireActivePharmacist(user);
+  if (!validObjectId(prescriptionId)) throw serviceError('A valid prescription ID is required');
+  let prescription;
+  try {
+    prescription = await Prescription.findById(prescriptionId)
+      .select('_id patient encounter doctor medication drugName dose route frequency duration quantity status prescribedAt')
+      .lean();
+  } catch (_) {
+    throw serviceError('Unable to retrieve prescription details', 500);
+  }
+  if (!prescription) throw serviceError('Prescription not found', 404);
+  try {
+    const [patient, encounter, doctor, medication, dispensingHistory] = await Promise.all([
+      Patient.findById(prescription.patient).select('_id mrn firstName fatherName grandfatherName').lean(),
+      Encounter.findById(prescription.encounter).select('_id patient visitNumber').lean(),
+      User.findById(prescription.doctor).select('_id fullName').lean(),
+      prescription.medication
+        ? Medication.findById(prescription.medication).select('_id name strength dosageForm isActive').lean()
+        : (() => {
+            const normalizedName = String(prescription.drugName || '').normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en');
+            return Medication.find({ name: normalizedName, isActive: true })
+              .select('_id name strength dosageForm isActive')
+              .limit(2)
+              .lean()
+              .then((matches) => matches.length === 1 ? matches[0] : null);
+          })(),
+      Dispense.find({ prescription: prescription._id })
+        .select('_id quantityDispensed unit dispensedAt')
+        .sort({ dispensedAt: 1, _id: 1 })
+        .lean()
+    ]);
+    const projected = prescriptionProjection({ ...prescription, dispensingHistory });
+    return {
+      ...projected,
+      patient: patient && { id: patient._id.toString(), mrn: patient.mrn, firstName: patient.firstName, fatherName: patient.fatherName, grandfatherName: patient.grandfatherName },
+      encounter: encounter && { id: encounter._id.toString(), visitNumber: encounter.visitNumber },
+      doctor: doctor && { id: doctor._id.toString(), fullName: doctor.fullName },
+      medication: medication
+        ? { id: medication._id.toString(), name: medication.name, strength: medication.strength, dosageForm: medication.dosageForm, active: medication.isActive === true }
+        : { id: null, name: prescription.drugName },
+      canDispense: DISPENSABLE_STATUSES.includes(prescription.status) && projected.remainingQuantity > 0 &&
+        medication?.isActive === true && Boolean(patient && encounter && String(encounter.patient) === String(patient._id))
+    };
+  } catch (error) {
+    if (error.name === 'PharmacyServiceError') throw error;
+    throw serviceError('Unable to retrieve prescription details', 500);
+  }
+}
+
 async function findStockAdditionAudit(pharmacistId, inventoryId, operationHash, deduplicationKey) {
   try {
     const filter = deduplicationKey
@@ -826,6 +1108,8 @@ function transactionTopologyAvailable() {
 
 module.exports = {
   getMedicationInventory,
+  listPendingPrescriptions,
+  getPharmacistPrescriptionDetails,
   addInventoryStock,
   dispensePrescription
 };

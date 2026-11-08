@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 const {
   getMedicationInventory,
+  listPendingPrescriptions,
+  getPharmacistPrescriptionDetails,
   addInventoryStock,
   dispensePrescription
 } = require('../services/pharmacy.service');
@@ -64,6 +66,36 @@ async function getInventory(req, res, next) {
   }
 }
 
+async function listPending(req, res, next) {
+  if (Object.keys(req.query).some((key) => !['page', 'limit'].includes(key))) {
+    return badRequest(res, 'Request contains unsupported query parameters');
+  }
+  try {
+    const result = await listPendingPrescriptions({ page: req.query.page, limit: req.query.limit }, req.user);
+    return res.status(200).json({
+      success: true,
+      message: 'Pending prescriptions retrieved successfully',
+      data: result
+    });
+  } catch (error) {
+    return respondWithServiceError(error, res, next);
+  }
+}
+
+async function prescriptionDetails(req, res, next) {
+  if (!validId(req.params.prescriptionId)) return badRequest(res, 'A valid prescription ID is required');
+  try {
+    const prescription = await getPharmacistPrescriptionDetails(req.params.prescriptionId, req.user);
+    return res.status(200).json({
+      success: true,
+      message: 'Prescription details retrieved successfully',
+      data: prescription
+    });
+  } catch (error) {
+    return respondWithServiceError(error, res, next);
+  }
+}
+
 async function addStock(req, res, next) {
   if (!validId(req.params.inventoryId)) return badRequest(res, 'A valid inventory ID is required');
   const bodyError = validateBody(req.body, STOCK_FIELDS);
@@ -109,4 +141,4 @@ async function dispense(req, res, next) {
   }
 }
 
-module.exports = { getInventory, addStock, dispense };
+module.exports = { getInventory, listPending, prescriptionDetails, addStock, dispense };
